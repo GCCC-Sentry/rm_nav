@@ -17,7 +17,6 @@
 #include "tf2/utils.hpp"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 #include <cmath>
-#include "std_msgs/msg/int8.hpp" // [新增] 引入 Int8 消息头文件
 
 namespace fake_vel_transform
 {
@@ -43,9 +42,6 @@ FakeVelTransform::FakeVelTransform(const rclcpp::NodeOptions & options)
   this->get_parameter("output_cmd_vel_topic", output_cmd_vel_topic_);
   this->get_parameter("init_spin_speed", spin_speed_);
 
-  // [新增] 初始化模式为 0 (正常/小陀螺模式)
-  chassis_mode_ = 0;
-
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
   cmd_vel_chassis_pub_ =
@@ -57,11 +53,6 @@ FakeVelTransform::FakeVelTransform(const rclcpp::NodeOptions & options)
     input_cmd_vel_topic_, 10,
     std::bind(&FakeVelTransform::cmdVelCallback, this, std::placeholders::_1));
 
-  // [新增] 订阅底盘模式控制话题 /cmd_chassis_mode
-  mode_sub_ = this->create_subscription<std_msgs::msg::Int8>(
-    "/cmd_chassis_mode", 10, 
-    std::bind(&FakeVelTransform::modeCallback, this, std::placeholders::_1));
-
   odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
     odom_topic_, rclcpp::SensorDataQoS(),
     std::bind(&FakeVelTransform::odometryCallback, this, std::placeholders::_1));
@@ -69,14 +60,6 @@ FakeVelTransform::FakeVelTransform(const rclcpp::NodeOptions & options)
   // 50Hz Timer to send transform from `robot_base_frame` to `fake_robot_base_frame`
   timer_ = this->create_wall_timer(
     std::chrono::milliseconds(20), std::bind(&FakeVelTransform::publishTransform, this));
-}
-
-// [新增] 模式切换回调函数
-void FakeVelTransform::modeCallback(const std_msgs::msg::Int8::SharedPtr msg)
-{
-  chassis_mode_ = msg->data;
-  // 可以选择打印日志确认
-  // RCLCPP_INFO(get_logger(), "Switching chassis mode to: %d", chassis_mode_);
 }
 
 void FakeVelTransform::cmdSpinCallback(const example_interfaces::msg::Float32::SharedPtr msg)
@@ -114,41 +97,11 @@ geometry_msgs::msg::Twist FakeVelTransform::transformVelocity(
 {
   geometry_msgs::msg::Twist aft_tf_vel;
 
-  // 根据模式选择旋转策略
-  if (chassis_mode_ == 1) {
-    // === 模式 1: 对齐颠簸路段模式 ===
-    
-    // 设置目标朝向 (0.0 代表地图正东方 X轴，请根据实际场地调整)
-    double target_yaw = -1.28; 
-    
-    // 计算误差 (当前角度就是 yaw_diff)
-    double error = target_yaw - yaw_diff;
+  aft_tf_vel.angular.z = twist->angular.z + spin_speed_;
 
-    // 角度归一化 (-PI 到 PI)
-    while (error > M_PI) error -= 2.0 * M_PI;
-    while (error < -M_PI) error += 2.0 * M_PI;
-
-    // P 控制器
-    double Kp = 2.0; // 比例系数
-    double output_w = Kp * error;
-
-    // 限幅
-    if (output_w > 3.0) output_w = 3.0;
-    if (output_w < -3.0) output_w = -3.0;
-
-    // 覆盖旋转速度
-    aft_tf_vel.angular.z = output_w;
-
-  } else {
-    // === 模式 0: 正常/小陀螺模式 (保持原有逻辑) ===
-    aft_tf_vel.angular.z = twist->angular.z + spin_speed_;
-  }
-
-  // 线速度坐标转换 (将地图系速度转换为底盘系速度)
-  // 保持原有逻辑不变，使平移运动不受影响
   aft_tf_vel.linear.x = twist->linear.x * cos(yaw_diff) + twist->linear.y * sin(yaw_diff);
   aft_tf_vel.linear.y = -twist->linear.x * sin(yaw_diff) + twist->linear.y * cos(yaw_diff);
-  
+
   return aft_tf_vel;
 }
 

@@ -21,7 +21,6 @@
 
 #include "example_interfaces/msg/float32.hpp"
 #include "geometry_msgs/msg/twist.hpp"
-#include "std_msgs/msg/int8.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "tf2_ros/transform_broadcaster.h"
@@ -38,9 +37,6 @@ private:
   void cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg);
   void cmdSpinCallback(example_interfaces::msg::Float32::SharedPtr msg);
   
-  // [新增] 模式切换回调函数声明
-  void modeCallback(const std_msgs::msg::Int8::SharedPtr msg);
-
   void publishTransform();
   geometry_msgs::msg::Twist transformVelocity(
     const geometry_msgs::msg::Twist::SharedPtr & twist, float yaw_diff);
@@ -48,9 +44,6 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
   rclcpp::Subscription<example_interfaces::msg::Float32>::SharedPtr cmd_spin_sub_;
   
-  // [新增] 模式控制订阅者声明
-  rclcpp::Subscription<std_msgs::msg::Int8>::SharedPtr mode_sub_;
-
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
 
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_chassis_pub_;
@@ -67,9 +60,6 @@ private:
   std::string output_cmd_vel_topic_;
   float spin_speed_;
   
-  // [新增] 当前底盘模式变量 (0:正常, 1:对齐)
-  int chassis_mode_;
-
   std::atomic<double> current_robot_base_angle_{0.0};
 };
 
