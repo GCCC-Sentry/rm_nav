@@ -1431,10 +1431,12 @@ except ImportError:
     exit(1)
 
 # 姿态 ID → 下位机 running_state 映射
+# 注意: 1/2/3 专用于姿态切换, 5 专用于颠簸区域底盘对齐 (由 region_monitor 发送)
+# 两套逻辑互不干扰: 姿态走 /cmd_stance, 颠簸区域走 /cmd_chassis_mode
 STANCE_TO_RUNNING_STATE = {
-    0: 7,   # 移动姿态
-    1: 5,   # 进攻姿态
-    2: 6,   # 防御姿态
+    0: 1,   # 移动姿态  (running_state=1)
+    1: 2,   # 进攻姿态  (running_state=2)
+    2: 3,   # 防御姿态  (running_state=3)
 }
 
 # ================= RoboMaster 官方 CRC16 查表算法 =================
@@ -1499,7 +1501,7 @@ class SerialNode(Node):
         self.serial_conn = None
         self.running = True
         self.chassis_mode = 0
-        self.stance_running_state = 7  # 默认移动姿态 (running_state=7)
+        self.stance_running_state = 1  # 默认移动姿态 (running_state=1)
 
         self.create_subscribers()
         self.create_publishers()
@@ -1616,12 +1618,13 @@ class SerialNode(Node):
     def stance_callback(self, msg):
         """接收行为树姿态指令, 映射为下位机 running_state"""
         stance_id = int(msg.data)
-        new_state = STANCE_TO_RUNNING_STATE.get(stance_id, 7)
+        new_state = STANCE_TO_RUNNING_STATE.get(stance_id, 1)
         if new_state != self.stance_running_state:
             self.stance_running_state = new_state
+            stance_names = {1: '移动', 2: '进攻', 3: '防御'}
             self.get_logger().info(
                 f'姿态切换: stance_id={stance_id} -> running_state={new_state} '
-                f'({"进攻" if new_state == 5 else "防御" if new_state == 6 else "移动"})')
+                f'({stance_names.get(new_state, "未知")})')
 
     def send_to_stm32_callback(self, msg):
         """发送控制指令至下位机 (协议头 0xAA)"""

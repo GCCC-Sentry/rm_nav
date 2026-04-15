@@ -19,10 +19,10 @@ BUMP_ZONES = [
     {
         'name': 'bump_zone_1',
         'vertices': [
-            (1.0, -1.0),
-            (3.0, -1.0),
-            (3.0,  1.0),
-            (1.0,  1.0),
+                (-5.77, -3.68),
+                (-5.84, -6.06),
+                (1.07, -6.00),
+                (1.38, -3.96),
         ],
         'target_yaw': 0.0,       # yaw=0 即 map +X 方向
         'forward_speed': 1.0,    # 前进速度 m/s
@@ -36,17 +36,14 @@ BUMP_ZONES = [
     # },
 ]
 
-# yaw PD控制器参数
-BUMP_YAW_KP = 1.5           # 比例增益 (降低防超调)
-BUMP_YAW_KD = 0.3           # 微分增益 (抑制振荡)
-BUMP_YAW_MAX_OUTPUT = 2.0   # 角速度限幅 (rad/s)
-BUMP_YAW_DEADBAND = 0.05    # 死区 (rad, ~3°以内不纠正)
+# yaw 差值参数 (不再做PD控制, 直接发送yaw偏差给下位机)
 
 # 颠簸区域覆盖发送频率 (Hz)
 BUMP_OVERRIDE_RATE = 50.0
 
 # 进入颠簸区域时发给 /cmd_chassis_mode 的 running_state 值
-BUMP_RUNNING_STATE = 5  # 进攻姿态 (低底盘, 适合跨越颠簸路段)
+# 注意: running_state=5 专用于颠簸区域底盘 yaw 对齐, 与姿态切换 (1/2/3) 是两套独立逻辑
+BUMP_RUNNING_STATE = 5  # 颠簸区域底盘对齐模式 (非姿态切换)
 # ================================================
 
 
@@ -75,10 +72,10 @@ class RegionMonitorNode(Node):
             {
                 'name': 'patrol_zone_1',
                 'vertices': [
-                    (-5.77, -3.68),
-                    (-5.84, -6.06),
-                    (1.07, -6.00),
-                    (1.38, -3.96),
+                    (-1.77, -0.68),
+                    (-1.84, -0.06),
+                    (0.07, -0.01),
+                    (0.38, -.96),
                 ]
             },
             # 您可以添加更多普通监控区域...
@@ -102,8 +99,7 @@ class RegionMonitorNode(Node):
         self.active_bump_zone = None       # 当前激活的颠簸区域配置
         self.current_yaw = 0.0
         self.pose_valid = False
-        self.prev_yaw_error = 0.0          # PD 控制器: 上一次误差
-        self.prev_yaw_time = None          # PD 控制器: 上一次时间戳
+        self.initial_yaw = None            # 节点启动后首次获取TF时记录的初始 yaw
 
         # 定时器: 10Hz 检查区域 + 发布可视化
         self.timer = self.create_timer(0.1, self.timer_callback)
@@ -139,6 +135,24 @@ class RegionMonitorNode(Node):
             current_y = t.transform.translation.y
             self.current_yaw = quaternion_to_yaw(t.transform.rotation)
             self.pose_valid = True
+
+            # 首次获取到TF时记录初始 yaw (节点启动时刻)
+            if self.initial_yaw is None:
+                self.initial_yaw = self.current_yaw
+                self.get_logger().info(
+                    f'记录启动初始 yaw={math.degrees(self.initial_yaw):.1f}°')
+
+            # ===== 实时计算 yaw 差值并通过串口发送给下位机 =====
+            yaw_diff = normalize_angle(self.current_yaw - self.initial_yaw)
+            yaw_diff_deg = math.degrees(yaw_diff)
+            yaw_twist = Twist()
+            yaw_twist.angular.z = yaw_diff_deg
+            self.cmd_vel_pub.publish(yaw_twist)
+            self.get_logger().info(
+                f'[yaw差值] 初始={math.degrees(self.initial_yaw):.1f}° '
+                f'当前={math.degrees(self.current_yaw):.1f}° '
+                f'差值={yaw_diff_deg:.1f}° '
+                f'angular.z={yaw_diff_deg:.2f}°')
 
             # 2. 检查普通监控区域 + 发布可视化
             in_any_region = False
@@ -203,15 +217,13 @@ class RegionMonitorNode(Node):
     def _on_enter_bump_zone(self):
         """进入颠簸区域: 启动高频覆盖定时器"""
         zone = self.active_bump_zone
+
         self.get_logger().warn(
             f'>>> 进入颠簸区域 [{zone["name"]}]! '
             f'强制 running_state={BUMP_RUNNING_STATE}, '
             f'x={zone["forward_speed"]}, y=0, '
-            f'yaw→{math.degrees(zone["target_yaw"]):.1f}°')
-
-        # 重置 PD 控制器状态
-        self.prev_yaw_error = 0.0
-        self.prev_yaw_time = None
+            f'启动初始yaw={math.degrees(self.initial_yaw):.1f}°, '
+            f'当前yaw={math.degrees(self.current_yaw):.1f}°')
 
         # 发布 running_state 切换
         mode_msg = Int8()
@@ -243,49 +255,27 @@ class RegionMonitorNode(Node):
         self.cmd_vel_pub.publish(stop_msg)
 
     def _bump_override_callback(self):
-        """高频定时器: 在颠簸区域内持续发布强制速度指令"""
+        """高频定时器: 在颠簸区域内持续发布强制速度指令 (前进速度 + running_state)"""
         if not self.in_bump_zone or self.active_bump_zone is None:
             return
 
-        # 【关键修复】每次都读取最新 TF, 避免使用 10Hz timer 的过期 yaw 数据
-        try:
-            t = self.tf_buffer.lookup_transform(
-                'map', 'base_footprint', rclpy.time.Time())
-            fresh_yaw = quaternion_to_yaw(t.transform.rotation)
-        except TransformException:
-            return  # TF 不可用, 跳过本次
-
         zone = self.active_bump_zone
-        now = self.get_clock().now()
 
-        # 构建 Twist 消息
+        # 构建 Twist 消息: 前进速度 + 实时yaw差值
         twist = Twist()
         twist.linear.x = zone['forward_speed']   # 强制前进
         twist.linear.y = 0.0                      # 不侧移
 
-        # yaw PD 控制器: 对齐目标方向 (使用实时 yaw)
-        yaw_error = normalize_angle(zone['target_yaw'] - fresh_yaw)
-
-        # 死区: 误差足够小时不再纠正, 防止抖动
-        if abs(yaw_error) < BUMP_YAW_DEADBAND:
-            twist.angular.z = 0.0
-        else:
-            # P 项
-            p_term = BUMP_YAW_KP * yaw_error
-
-            # D 项 (抑制振荡)
-            d_term = 0.0
-            if self.prev_yaw_time is not None:
-                dt = (now - self.prev_yaw_time).nanoseconds * 1e-9
-                if dt > 0.001:  # 防止除零
-                    d_term = BUMP_YAW_KD * (yaw_error - self.prev_yaw_error) / dt
-
-            yaw_cmd = p_term + d_term
-            yaw_cmd = max(-BUMP_YAW_MAX_OUTPUT, min(BUMP_YAW_MAX_OUTPUT, yaw_cmd))
-            twist.angular.z = yaw_cmd
-
-        self.prev_yaw_error = yaw_error
-        self.prev_yaw_time = now
+        # yaw差值也一并发送 (与主timer相同逻辑, 但更高频)
+        if self.initial_yaw is not None:
+            try:
+                t = self.tf_buffer.lookup_transform(
+                    'map', 'base_footprint', rclpy.time.Time())
+                fresh_yaw = quaternion_to_yaw(t.transform.rotation)
+                yaw_diff = normalize_angle(fresh_yaw - self.initial_yaw)
+                twist.angular.z = math.degrees(yaw_diff)
+            except TransformException:
+                pass
 
         self.cmd_vel_pub.publish(twist)
 
