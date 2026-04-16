@@ -3,14 +3,14 @@
 <package format="3">
   <name>odom_to_px4</name>
   <version>1.0.0</version>
-  <description>Bridge node: subscribes to nav_msgs/Odometry and publishes px4_msgs/VehicleOdometry for PX4 v1.15 via uXRCE-DDS</description>
+  <description>Bridge node: subscribes to nav_msgs/Odometry and sends MAVLink ODOMETRY to PX4 v1.15 via serial</description>
   <maintainer email="adam@todo.todo">adam</maintainer>
   <license>MIT</license>
 
   <depend>rclpy</depend>
   <depend>nav_msgs</depend>
-  <depend>px4_msgs</depend>
   <depend>std_msgs</depend>
+  <exec_depend>python3-pymavlink</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

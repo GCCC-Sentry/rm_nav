@@ -261,10 +261,11 @@ class RegionMonitorNode(Node):
 
         zone = self.active_bump_zone
 
-        # 构建 Twist 消息: 前进速度 + 实时yaw差值
+        # 构建 Twist 消息: 仅发送实时yaw差值, 不覆盖xy速度
         twist = Twist()
-        twist.linear.x = zone['forward_speed']   # 强制前进
-        twist.linear.y = 0.0                      # 不侧移
+        # 颠簸路段取消高频发送xy速度, 由导航栈自行控制
+        # twist.linear.x = zone['forward_speed']
+        # twist.linear.y = 0.0
 
         # yaw差值也一并发送 (与主timer相同逻辑, 但更高频)
         if self.initial_yaw is not None:

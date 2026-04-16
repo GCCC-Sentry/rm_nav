@@ -1,11 +1,53 @@
-# odom_to_px4 参数配置
+# odom_to_px4 参数配置 (MAVLink 串口模式)
 odom_to_px4_node:
   ros__parameters:
     # 订阅的 ROS 里程计话题
     odom_topic: "odometry"
-    # 发布到 PX4 的话题
-    px4_odom_topic: "/fmu/in/vehicle_visual_odometry"
-    # 启用 PX4 时间同步
-    use_timesync: true
+    # 连接 PX4 飞控的串口设备
+    serial_port: "/dev/ttyUSB0"
+    # 串口波特率 (需与飞控 TELEM 端口一致)
+    baudrate: 921600
     # 启用 ENU→NED / FLU→FRD 坐标系转换
     convert_enu_to_ned: true
+    # 调试信息打印频率 (Hz), 0=关闭
+    debug_print_rate: 1.0
+    # MAVLink ID
+    # MAVLink ID (sys_id 不能与飞控相同, 飞控默认=1, 地面站=255, 机载电脑推荐=2)
+    mav_sys_id: 2
+    mav_comp_id: 197   # MAV_COMP_ID_VISUAL_INERTIAL_ODOMETRY
+
+# ============================================================
+# PX4 飞控端配置说明 (QGroundControl 参数):
+# ============================================================
+#
+# 1. TELEM2 串口配置 (MAVLink 通道):
+#    MAV_1_CONFIG  = TELEM2 (102)
+#    MAV_1_MODE    = Onboard (2)   ← 机载电脑模式
+#    MAV_1_RATE    = 0             ← 不限速
+#    SER_TEL2_BAUD = 921600        ← 与上面 baudrate 一致
+#
+# 2. 启用外部视觉定位融合:
+#    EKF2_EV_CTRL  = 15     (位置+速度+偏航融合, 按需设置)
+#    EKF2_HGT_REF  = 3      (使用视觉高度)
+#    EKF2_EV_DELAY = 0~50   (视觉延迟 ms, 根据实际调整)
+#
+# 3. 坐标系匹配 (本节点已自动处理 ENU→NED):
+#    EKF2_EV_POS_X/Y/Z = 传感器安装偏移 (m)
+#
+# ============================================================
+# 常用串口设备:
+# ============================================================
+#   /dev/ttyUSB0  - USB-TTL 转换器 → 飞控 TELEM2
+#   /dev/ttyACM0  - USB 直连 Pixhawk
+#   /dev/ttyTHS1  - Jetson UART (连接 TELEM2)
+#   /dev/ttyAMA0  - 树莓派 UART
+#
+# ============================================================
+# 接线说明 (USB-TTL → 飞控 TELEM2):
+# ============================================================
+#   USB-TTL        TELEM2(飞控)
+#     TX    →       RX
+#     RX    ←       TX
+#     GND   ─       GND
+#   注意: TX/RX 必须交叉对接!
+# ============================================================
