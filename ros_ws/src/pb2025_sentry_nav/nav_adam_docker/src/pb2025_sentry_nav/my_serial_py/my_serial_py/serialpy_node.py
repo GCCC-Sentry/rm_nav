@@ -1417,9 +1417,8 @@ import struct
 import threading
 import time
 import libscrc
-from std_msgs.msg import Int8
+from std_msgs.msg import Int8, Float32
 from geometry_msgs.msg import Twist
-from example_interfaces.msg import Float32
 
 # 导入自定义接口
 try:
@@ -1502,18 +1501,26 @@ class SerialNode(Node):
         self.running = True
         self.chassis_mode = 0
         self.stance_running_state = 1  # 默认移动姿态 (running_state=1)
+        self.yaw_speed = 0.0  # 来自 /cmd_yaw_speed 的独立 yaw 速度
+        self.latest_x = 0.0   # 缓存最新 cmd_vel
+        self.latest_y = 0.0
 
         self.create_subscribers()
         self.create_publishers()
 
         self.read_thread = threading.Thread(target=self.serial_read_loop, daemon=True)
         self.read_thread.start()
+
+        # 定时发送定时器: 50Hz 合并 cmd_vel + yaw_speed 发送给下位机
+        self.send_timer = self.create_timer(0.02, self.periodic_send_to_stm32)
+
         self.get_logger().info(f'✅ 串口节点已启动。当前解析顺序: Type -> Progress -> HP')
 
     def create_subscribers(self):
-        self.subscription = self.create_subscription(Twist, '/cmd_vel', self.send_to_stm32_callback, 10)
+        self.cmd_vel_sub = self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)
         self.mode_sub = self.create_subscription(Int8, '/cmd_chassis_mode', self.chassis_mode_callback, 10)
         self.stance_sub = self.create_subscription(Float32, '/cmd_stance', self.stance_callback, 10)
+        self.yaw_speed_sub = self.create_subscription(Float32, '/cmd_yaw_speed', self.yaw_speed_callback, 10)
 
     def create_publishers(self):
         # 使用绝对路径发布话题，供行为树使用
@@ -1615,6 +1622,16 @@ class SerialNode(Node):
     def chassis_mode_callback(self, msg):
         self.chassis_mode = msg.data
 
+    def yaw_speed_callback(self, msg):
+        """接收 region_monitor 发来的独立 yaw_speed (°/s)"""
+        self.yaw_speed = msg.data
+        self.get_logger().debug(f'[yaw_speed] 收到: {msg.data:.1f}')
+
+    def cmd_vel_callback(self, msg):
+        """缓存最新的 cmd_vel xy 速度"""
+        self.latest_x = msg.linear.x
+        self.latest_y = msg.linear.y
+
     def stance_callback(self, msg):
         """接收行为树姿态指令, 映射为下位机 running_state"""
         stance_id = int(msg.data)
@@ -1626,18 +1643,24 @@ class SerialNode(Node):
                 f'姿态切换: stance_id={stance_id} -> running_state={new_state} '
                 f'({stance_names.get(new_state, "未知")})')
 
-    def send_to_stm32_callback(self, msg):
-        """发送控制指令至下位机 (协议头 0xAA)"""
+    def periodic_send_to_stm32(self):
+        """定时合并发送: xy来自 cmd_vel缓存, yaw_speed来自 /cmd_yaw_speed"""
         if not (self.serial_conn and self.serial_conn.is_open): return
         try:
             header = 0xAA
-            # 优先使用姿态系统的 running_state, 如果 chassis_mode 非零则用 chassis_mode
             running_state = self.stance_running_state if self.chassis_mode == 0 else self.chassis_mode
-            payload = struct.pack('<BffffB', header, float(-msg.linear.x*1.0), float(-msg.linear.y*1.0),
-                                  float(msg.angular.z), float(msg.angular.z), int(running_state))
+            x_val = float(-self.latest_x * 1.0)
+            y_val = float(-self.latest_y * 1.0)
+            yaw_val = float(self.yaw_speed)
+            payload = struct.pack('<BffffB', header,
+                                  x_val, y_val,
+                                  yaw_val, yaw_val,
+                                  int(running_state))
             crc_val = libscrc.modbus(payload)
-            self.serial_conn.write(payload + struct.pack('<H', crc_val))
-        except Exception: pass
+            final_packet = payload + struct.pack('<H', crc_val)
+            self.serial_conn.write(final_packet)
+        except Exception as e:
+            self.get_logger().error(f'[TX] 发送异常: {e}')
 
     def destroy_node(self):
         self.running = False

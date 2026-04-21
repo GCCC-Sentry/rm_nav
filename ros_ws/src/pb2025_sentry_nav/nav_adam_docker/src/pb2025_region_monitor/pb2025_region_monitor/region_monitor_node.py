@@ -2,8 +2,8 @@ import rclpy
 import math
 from rclpy.node import Node
 from geometry_msgs.msg import Point, Twist
+from std_msgs.msg import Int8, Float32
 from visualization_msgs.msg import Marker, MarkerArray
-from std_msgs.msg import Int8
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -36,7 +36,11 @@ BUMP_ZONES = [
     # },
 ]
 
-# yaw 差值参数 (不再做PD控制, 直接发送yaw偏差给下位机)
+# yaw 速度控制参数 (PD控制, 基于初始 yaw 差值计算 yaw_speed)
+YAW_KP = 1.2                # 比例增益 (deg/s per deg) — 降低防超调
+YAW_KD = 0.3                # 微分增益 — 抑制振荡
+YAW_MAX_SPEED = 180.0       # yaw 速度限幅 (°/s)
+YAW_DEADBAND_DEG = 3.0      # 死区 (°, 差值小于此值不纠正)
 
 # 颠簸区域覆盖发送频率 (Hz)
 BUMP_OVERRIDE_RATE = 50.0
@@ -87,6 +91,7 @@ class RegionMonitorNode(Node):
 
         # ===== 颠簸区域穿越: 发布控制指令 =====
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.yaw_speed_pub = self.create_publisher(Float32, '/cmd_yaw_speed', 10)
         self.chassis_mode_pub = self.create_publisher(Int8, '/cmd_chassis_mode', 10)
 
         # TF 监听器
@@ -100,6 +105,8 @@ class RegionMonitorNode(Node):
         self.current_yaw = 0.0
         self.pose_valid = False
         self.initial_yaw = None            # 节点启动后首次获取TF时记录的初始 yaw
+        self.prev_yaw_diff_deg = 0.0       # 上一次 yaw 差值 (用于D项)
+        self.prev_yaw_time = None          # 上一次计算时间戳
 
         # 定时器: 10Hz 检查区域 + 发布可视化
         self.timer = self.create_timer(0.1, self.timer_callback)
@@ -142,17 +149,34 @@ class RegionMonitorNode(Node):
                 self.get_logger().info(
                     f'记录启动初始 yaw={math.degrees(self.initial_yaw):.1f}°')
 
-            # ===== 实时计算 yaw 差值并通过串口发送给下位机 =====
+            # ===== PD 控制器: 计算 yaw_speed =====
             yaw_diff = normalize_angle(self.current_yaw - self.initial_yaw)
             yaw_diff_deg = math.degrees(yaw_diff)
-            yaw_twist = Twist()
-            yaw_twist.angular.z = yaw_diff_deg
-            self.cmd_vel_pub.publish(yaw_twist)
+
+            now = self.get_clock().now()
+            if abs(yaw_diff_deg) < YAW_DEADBAND_DEG:
+                yaw_speed = 0.0
+            else:
+                p_term = YAW_KP * yaw_diff_deg
+                d_term = 0.0
+                if self.prev_yaw_diff_deg is not None and self.prev_yaw_time is not None:
+                    dt = (now - self.prev_yaw_time).nanoseconds / 1e9
+                    if dt > 0:
+                        d_term = YAW_KD * (yaw_diff_deg - self.prev_yaw_diff_deg) / dt
+                yaw_speed = p_term + d_term
+                yaw_speed = max(-YAW_MAX_SPEED, min(YAW_MAX_SPEED, yaw_speed))
+
+            self.prev_yaw_diff_deg = yaw_diff_deg
+            self.prev_yaw_time = now
+
+            yaw_twist = Float32()
+            yaw_twist.data = yaw_speed
+            self.yaw_speed_pub.publish(yaw_twist)
             self.get_logger().info(
-                f'[yaw差值] 初始={math.degrees(self.initial_yaw):.1f}° '
+                f'[yaw] 初始={math.degrees(self.initial_yaw):.1f}° '
                 f'当前={math.degrees(self.current_yaw):.1f}° '
                 f'差值={yaw_diff_deg:.1f}° '
-                f'angular.z={yaw_diff_deg:.2f}°')
+                f'yaw_speed={yaw_speed:.1f}°/s')
 
             # 2. 检查普通监控区域 + 发布可视化
             in_any_region = False
@@ -261,20 +285,29 @@ class RegionMonitorNode(Node):
 
         zone = self.active_bump_zone
 
-        # 构建 Twist 消息: 仅发送实时yaw差值, 不覆盖xy速度
+        # 颠簸区域: 发布前进速度通过 cmd_vel (只设置xy, yaw由独立话题发)
         twist = Twist()
-        # 颠簸路段取消高频发送xy速度, 由导航栈自行控制
-        # twist.linear.x = zone['forward_speed']
-        # twist.linear.y = 0.0
+        twist.linear.x = zone['forward_speed']
+        twist.linear.y = 0.0
+        twist.angular.z = 0.0
+        self.cmd_vel_pub.publish(twist)
 
-        # yaw差值也一并发送 (与主timer相同逻辑, 但更高频)
+        # yaw_speed 通过独立话题发送 (与主timer相同逻辑, 但更高频)
         if self.initial_yaw is not None:
             try:
                 t = self.tf_buffer.lookup_transform(
                     'map', 'base_footprint', rclpy.time.Time())
                 fresh_yaw = quaternion_to_yaw(t.transform.rotation)
                 yaw_diff = normalize_angle(fresh_yaw - self.initial_yaw)
-                twist.angular.z = math.degrees(yaw_diff)
+                yaw_diff_deg = math.degrees(yaw_diff)
+                if abs(yaw_diff_deg) < YAW_DEADBAND_DEG:
+                    yaw_speed = 0.0
+                else:
+                    yaw_speed = YAW_KP * yaw_diff_deg
+                    yaw_speed = max(-YAW_MAX_SPEED, min(YAW_MAX_SPEED, yaw_speed))
+                yaw_msg = Float32()
+                yaw_msg.data = yaw_speed
+                self.yaw_speed_pub.publish(yaw_msg)
             except TransformException:
                 pass
 
