@@ -610,7 +610,7 @@ behavior_server:    #行为服务器
     spin: #旋转
       plugin: "nav2_behaviors/Spin"
     backup: #后退
-      plugin: "nav2_behaviors/BackUp"
+      plugin: "pb_nav2_behaviors/BackUpFreeSpace"
     drive_on_heading: #定向移动
       plugin: "nav2_behaviors/DriveOnHeading"
     wait: #等待
@@ -628,7 +628,7 @@ behavior_server:    #行为服务器
     # params for pb_nav2_behaviors/BackUpFreeSpace
     service_name: "global_costmap/get_costmap"
     max_radius: 2.0
-    visualize: false
+    visualize: true
 
 waypoint_follower:    #路径点跟随器
   ros__parameters:
