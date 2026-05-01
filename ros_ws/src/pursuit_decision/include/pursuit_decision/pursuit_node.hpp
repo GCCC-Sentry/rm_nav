@@ -4,15 +4,19 @@
 #include <chrono>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
+#include "geometry_msgs/msg/point.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
+#include "nav_msgs/msg/path.hpp"
 #include "pursuit_decision/target_validator.hpp"
 #include "pursuit_decision/zone_manager.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
+#include "visualization_msgs/msg/marker_array.hpp"
 
 namespace pursuit_decision
 {
@@ -107,7 +111,11 @@ private:
 
   // ===================== Publishers =====================
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr target_pose_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr attack_pose_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pursuit_status_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_markers_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr goal_history_pub_;
 
   // ===================== Timer =====================
   rclcpp::TimerBase::SharedPtr decision_timer_;    // 主决策循环
@@ -128,6 +136,13 @@ private:
   } game_status_;
 
   nav_msgs::msg::OccupancyGrid::SharedPtr costmap_;
+  nav_msgs::msg::Path goal_history_;
+
+  bool has_last_raw_target_map_{false};
+  geometry_msgs::msg::Point last_raw_target_map_;
+  bool has_last_goal_{false};
+  geometry_msgs::msg::PoseStamped last_goal_;
+  std::vector<geometry_msgs::msg::Point> last_candidate_points_;
 
   // ===================== 回调 =====================
   void on_aim_target(const std_msgs::msg::String::SharedPtr msg);
@@ -169,6 +184,9 @@ private:
 
   /// 发布追击状态
   void publish_pursuit_status();
+
+  /// 发布 RViz 调试可视化
+  void publish_debug_visualization();
 
   /// 发布撤退目标
   void publish_retreat_goal();

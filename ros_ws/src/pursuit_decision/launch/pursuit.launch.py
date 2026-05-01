@@ -8,9 +8,11 @@ def generate_launch_description():
     pkg_dir = get_package_share_directory('pursuit_decision')
     params_file = os.path.join(pkg_dir, 'config', 'pursuit_params.yaml')
 
-    # 使用 CycloneDDS 解决宿主机(Iron/Jazzy) 与 Docker(Humble) 的跨版本DDS通信问题
-    # FastDDS 的 TypeLookupService 在不同 ROS 2 版本之间不兼容
-    # CycloneDDS 不依赖 TypeHash, 可跨版本正常通信
+    # 不在 launch 中强制设置 RMW_IMPLEMENTATION。
+    # 否则当运行环境未安装 rmw_cyclonedds_cpp 时，节点会在启动阶段直接退出。
+    # 如果后续跨版本 DDS 联调确实需要 CycloneDDS，请在启动前显式导出：
+    #   export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+    # 前提是对应运行环境已经安装了 librmw_cyclonedds_cpp.so。
     pursuit_node = Node(
         package='pursuit_decision',
         executable='pursuit_node',
@@ -24,10 +26,15 @@ def generate_launch_description():
             ('global_costmap/costmap', 'global_costmap/costmap'),
             # 发出的导航目标
             ('goal_pose', 'goal_pose'),
+            # 单独可视化的目标点和攻击点
+            ('pursuit_target_pose', 'pursuit_target_pose'),
+            ('pursuit_attack_pose', 'pursuit_attack_pose'),
             # 追击状态
             ('pursuit_status', 'pursuit_status'),
+            # RViz 调试可视化
+            ('pursuit_debug_markers', 'pursuit_debug_markers'),
+            ('pursuit_goal_history', 'pursuit_goal_history'),
         ],
-        additional_env={'RMW_IMPLEMENTATION': 'rmw_cyclonedds_cpp'},
     )
 
     return LaunchDescription([pursuit_node])

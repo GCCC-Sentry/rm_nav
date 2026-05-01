@@ -1,5 +1,6 @@
 #include "pursuit_decision/pursuit_node.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <nlohmann/json.hpp>
 #include <sstream>
@@ -47,9 +48,17 @@ PursuitNode::PursuitNode(const rclcpp::NodeOptions & options)
 
   // === Publishers ===
   goal_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("goal_pose", 10);
+  target_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+    "pursuit_target_pose", 10);
+  attack_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+    "pursuit_attack_pose", 10);
 
   pursuit_status_pub_ = this->create_publisher<std_msgs::msg::String>(
     "pursuit_status", 10);
+  debug_markers_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+    "pursuit_debug_markers", 10);
+  goal_history_pub_ = this->create_publisher<nav_msgs::msg::Path>(
+    "pursuit_goal_history", 10);
 
   // === Timers ===
   // 主决策循环: 20Hz
@@ -67,6 +76,8 @@ PursuitNode::PursuitNode(const rclcpp::NodeOptions & options)
     "追击决策节点已启动. 触发距离=%.1fm, 确认帧数=%d, 最大追击时长=%.0fs, 区域检查=%s",
     params_.trigger_distance, params_.confirm_frames, params_.max_pursuit_duration,
     params_.enable_zone_check ? "开" : "关");
+
+  goal_history_.header.frame_id = params_.map_frame_id;
 }
 
 // ============================================================
@@ -302,6 +313,11 @@ void PursuitNode::on_aim_target(const std_msgs::msg::String::SharedPtr msg)
     "[坐标转换] world(%.3f,%.3f,%.3f) -> map(%.3f,%.3f,%.3f)",
     world_x, world_y, world_z, mx, my, mz);
 
+  has_last_raw_target_map_ = true;
+  last_raw_target_map_.x = mx;
+  last_raw_target_map_.y = my;
+  last_raw_target_map_.z = mz;
+
   // 构造观测并加入验证器
   TargetObservation obs;
   obs.armor_id = armor_id;
@@ -442,6 +458,14 @@ void PursuitNode::decision_callback()
           RCLCPP_INFO(this->get_logger(),
             "[追击启动] 立即发布第一个goal: (%.2f,%.2f)",
             goal.pose.position.x, goal.pose.position.y);
+          has_last_goal_ = true;
+          last_goal_ = goal;
+          goal_history_.header.stamp = goal.header.stamp;
+          goal_history_.poses.push_back(goal);
+          if (goal_history_.poses.size() > 200) {
+            goal_history_.poses.erase(goal_history_.poses.begin());
+          }
+          goal_history_pub_->publish(goal_history_);
           goal_pub_->publish(goal);
         } else {
           RCLCPP_WARN(this->get_logger(), "[追击启动] 首次compute_pursuit_goal失败");
@@ -518,6 +542,7 @@ void PursuitNode::decision_callback()
 
   // 每次决策循环都发布状态
   publish_pursuit_status();
+  publish_debug_visualization();
 }
 
 // ============================================================
@@ -542,6 +567,14 @@ void PursuitNode::goal_update_callback()
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
       "[目标更新] 发布追击goal: (%.2f,%.2f) -> target(%.2f,%.2f), approach_dist=%.2f",
       goal.pose.position.x, goal.pose.position.y, tx, ty, approach_dist);
+    has_last_goal_ = true;
+    last_goal_ = goal;
+    goal_history_.header.stamp = goal.header.stamp;
+    goal_history_.poses.push_back(goal);
+    if (goal_history_.poses.size() > 200) {
+      goal_history_.poses.erase(goal_history_.poses.begin());
+    }
+    goal_history_pub_->publish(goal_history_);
     goal_pub_->publish(goal);
   } else {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
@@ -741,6 +774,8 @@ bool PursuitNode::compute_pursuit_goal(
   double approach_dist,
   geometry_msgs::msg::PoseStamped & goal)
 {
+  last_candidate_points_.clear();
+
   double rx, ry, rz;
   if (!get_robot_position(rx, ry, rz)) {
     return false;
@@ -782,6 +817,11 @@ bool PursuitNode::compute_pursuit_goal(
 
     double dx = cx - rx;
     double dy = cy - ry;
+    geometry_msgs::msg::Point candidate_point;
+    candidate_point.x = cx;
+    candidate_point.y = cy;
+    candidate_point.z = 0.0;
+    last_candidate_points_.push_back(candidate_point);
     feasible.push_back({cx, cy, std::sqrt(dx * dx + dy * dy)});
   }
 
@@ -889,6 +929,230 @@ void PursuitNode::publish_pursuit_status()
   pursuit_status_pub_->publish(std::move(msg));
 }
 
+void PursuitNode::publish_debug_visualization()
+{
+  visualization_msgs::msg::MarkerArray markers;
+  auto now = this->now();
+  geometry_msgs::msg::PoseStamped target_pose_msg;
+  target_pose_msg.header.frame_id = params_.map_frame_id;
+  target_pose_msg.header.stamp = now;
+
+  auto make_marker =
+    [&](int id, int type, double scale_x, double scale_y, double scale_z,
+        double r, double g, double b, double a) {
+      visualization_msgs::msg::Marker marker;
+      marker.header.frame_id = params_.map_frame_id;
+      marker.header.stamp = now;
+      marker.ns = "pursuit_debug";
+      marker.id = id;
+      marker.type = type;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+      marker.scale.x = scale_x;
+      marker.scale.y = scale_y;
+      marker.scale.z = scale_z;
+      marker.color.r = r;
+      marker.color.g = g;
+      marker.color.b = b;
+      marker.color.a = a;
+      marker.pose.orientation.w = 1.0;
+      return marker;
+    };
+
+  auto append_delete_markers = [&]() {
+    for (int id = 0; id < 12; ++id) {
+      visualization_msgs::msg::Marker marker;
+      marker.header.frame_id = params_.map_frame_id;
+      marker.header.stamp = now;
+      marker.ns = "pursuit_debug";
+      marker.id = id;
+      marker.action = visualization_msgs::msg::Marker::DELETE;
+      markers.markers.push_back(marker);
+    }
+  };
+
+  double rx, ry, rz;
+  if (!get_robot_position(rx, ry, rz)) {
+    append_delete_markers();
+    debug_markers_pub_->publish(markers);
+    return;
+  }
+
+  {
+    auto marker = make_marker(0, visualization_msgs::msg::Marker::SPHERE,
+      0.35, 0.35, 0.35, 0.1, 0.9, 0.2, 1.0);
+    marker.pose.position.x = rx;
+    marker.pose.position.y = ry;
+    marker.pose.position.z = rz;
+    markers.markers.push_back(marker);
+  }
+
+  {
+    auto marker = make_marker(1, visualization_msgs::msg::Marker::LINE_STRIP,
+      0.05, 0.0, 0.0, 0.2, 0.8, 1.0, 0.8);
+    constexpr int kCircleSegments = 36;
+    for (int i = 0; i <= kCircleSegments; ++i) {
+      double angle = (2.0 * M_PI * static_cast<double>(i)) / kCircleSegments;
+      geometry_msgs::msg::Point p;
+      p.x = rx + params_.trigger_distance * std::cos(angle);
+      p.y = ry + params_.trigger_distance * std::sin(angle);
+      p.z = rz;
+      marker.points.push_back(p);
+    }
+    markers.markers.push_back(marker);
+  }
+
+  if (has_last_raw_target_map_) {
+    auto marker = make_marker(2, visualization_msgs::msg::Marker::SPHERE,
+      0.28, 0.28, 0.28, 1.0, 0.75, 0.0, 0.95);
+    marker.pose.position = last_raw_target_map_;
+    markers.markers.push_back(marker);
+  } else {
+    auto marker = make_marker(2, visualization_msgs::msg::Marker::SPHERE,
+      0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    marker.action = visualization_msgs::msg::Marker::DELETE;
+    markers.markers.push_back(marker);
+  }
+
+  double tx, ty, tz;
+  bool has_filtered_target = target_validator_.get_filtered_position(tx, ty, tz);
+  if (has_filtered_target) {
+    target_pose_msg.pose.position.x = tx;
+    target_pose_msg.pose.position.y = ty;
+    target_pose_msg.pose.position.z = tz;
+    target_pose_msg.pose.orientation.w = 1.0;
+    target_pose_pub_->publish(target_pose_msg);
+
+    auto marker = make_marker(3, visualization_msgs::msg::Marker::SPHERE,
+      0.32, 0.32, 0.32, 1.0, 0.15, 0.15, 1.0);
+    marker.pose.position.x = tx;
+    marker.pose.position.y = ty;
+    marker.pose.position.z = tz;
+    markers.markers.push_back(marker);
+
+    auto line = make_marker(4, visualization_msgs::msg::Marker::LINE_STRIP,
+      0.06, 0.0, 0.0, 1.0, 0.35, 0.35, 0.85);
+    geometry_msgs::msg::Point start;
+    start.x = rx;
+    start.y = ry;
+    start.z = rz;
+    geometry_msgs::msg::Point end;
+    end.x = tx;
+    end.y = ty;
+    end.z = tz;
+    line.points.push_back(start);
+    line.points.push_back(end);
+    markers.markers.push_back(line);
+
+    auto label = make_marker(10, visualization_msgs::msg::Marker::TEXT_VIEW_FACING,
+      0.0, 0.0, 0.32, 1.0, 0.25, 0.25, 1.0);
+    label.pose.position.x = tx;
+    label.pose.position.y = ty;
+    label.pose.position.z = tz + 0.45;
+    label.text = "enemy target";
+    markers.markers.push_back(label);
+  } else {
+    for (int id : {3, 4, 10}) {
+      auto marker = make_marker(id, visualization_msgs::msg::Marker::SPHERE,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+      marker.action = visualization_msgs::msg::Marker::DELETE;
+      markers.markers.push_back(marker);
+    }
+  }
+
+  if (!last_candidate_points_.empty()) {
+    auto marker = make_marker(5, visualization_msgs::msg::Marker::POINTS,
+      0.12, 0.12, 0.0, 0.1, 0.9, 1.0, 0.95);
+    marker.points = last_candidate_points_;
+    markers.markers.push_back(marker);
+  } else {
+    auto marker = make_marker(5, visualization_msgs::msg::Marker::POINTS,
+      0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    marker.action = visualization_msgs::msg::Marker::DELETE;
+    markers.markers.push_back(marker);
+  }
+
+  if (has_last_goal_) {
+    attack_pose_pub_->publish(last_goal_);
+
+    auto marker = make_marker(6, visualization_msgs::msg::Marker::ARROW,
+      0.55, 0.14, 0.14, 0.15, 0.35, 1.0, 1.0);
+    marker.pose = last_goal_.pose;
+    markers.markers.push_back(marker);
+
+    auto point_marker = make_marker(8, visualization_msgs::msg::Marker::CYLINDER,
+      0.45, 0.45, 0.12, 0.15, 0.35, 1.0, 0.9);
+    point_marker.pose.position = last_goal_.pose.position;
+    markers.markers.push_back(point_marker);
+
+    if (has_filtered_target) {
+      auto line = make_marker(9, visualization_msgs::msg::Marker::LINE_STRIP,
+        0.06, 0.0, 0.0, 1.0, 0.35, 0.35, 0.85);
+      geometry_msgs::msg::Point target_point;
+      target_point.x = tx;
+      target_point.y = ty;
+      target_point.z = tz;
+      geometry_msgs::msg::Point attack_point;
+      attack_point.x = last_goal_.pose.position.x;
+      attack_point.y = last_goal_.pose.position.y;
+      attack_point.z = last_goal_.pose.position.z;
+      line.points.push_back(target_point);
+      line.points.push_back(attack_point);
+      markers.markers.push_back(line);
+    }
+
+    auto label = make_marker(11, visualization_msgs::msg::Marker::TEXT_VIEW_FACING,
+      0.0, 0.0, 0.32, 0.15, 0.35, 1.0, 1.0);
+    label.pose.position.x = last_goal_.pose.position.x;
+    label.pose.position.y = last_goal_.pose.position.y;
+    label.pose.position.z = last_goal_.pose.position.z + 0.4;
+    label.text = "selected attack point";
+    markers.markers.push_back(label);
+  } else {
+    auto marker = make_marker(6, visualization_msgs::msg::Marker::ARROW,
+      0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    marker.action = visualization_msgs::msg::Marker::DELETE;
+    markers.markers.push_back(marker);
+    auto point_marker = make_marker(8, visualization_msgs::msg::Marker::CYLINDER,
+      0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    point_marker.action = visualization_msgs::msg::Marker::DELETE;
+    markers.markers.push_back(point_marker);
+    auto line = make_marker(9, visualization_msgs::msg::Marker::LINE_STRIP,
+      0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    line.action = visualization_msgs::msg::Marker::DELETE;
+    markers.markers.push_back(line);
+    auto label = make_marker(11, visualization_msgs::msg::Marker::TEXT_VIEW_FACING,
+      0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    label.action = visualization_msgs::msg::Marker::DELETE;
+    markers.markers.push_back(label);
+  }
+
+  {
+    auto marker = make_marker(7, visualization_msgs::msg::Marker::TEXT_VIEW_FACING,
+      0.0, 0.0, 0.45, 1.0, 1.0, 1.0, 1.0);
+    marker.pose.position.x = rx;
+    marker.pose.position.y = ry;
+    marker.pose.position.z = rz + 1.0;
+
+    std::ostringstream oss;
+    oss << "state=";
+    switch (state_) {
+      case PursuitState::IDLE: oss << "IDLE"; break;
+      case PursuitState::CONFIRMING: oss << "CONFIRMING"; break;
+      case PursuitState::PURSUING: oss << "PURSUING"; break;
+      case PursuitState::RETREATING: oss << "RETREATING"; break;
+    }
+    oss << " target_id=" << current_pursuit_target_id_;
+    oss << " hp=" << static_cast<int>(robot_status_.hp);
+    if (has_filtered_target) {
+      oss << " target=(" << tx << "," << ty << "," << tz << ")";
+    }
+    marker.text = oss.str();
+    markers.markers.push_back(marker);
+  }
+
+  debug_markers_pub_->publish(markers);
+}
+
 void PursuitNode::publish_retreat_goal()
 {
   geometry_msgs::msg::PoseStamped goal;
@@ -902,6 +1166,14 @@ void PursuitNode::publish_retreat_goal()
   q.setRPY(0, 0, params_.retreat_yaw);
   goal.pose.orientation = tf2::toMsg(q);
 
+  has_last_goal_ = true;
+  last_goal_ = goal;
+  goal_history_.header.stamp = goal.header.stamp;
+  goal_history_.poses.push_back(goal);
+  if (goal_history_.poses.size() > 200) {
+    goal_history_.poses.erase(goal_history_.poses.begin());
+  }
+  goal_history_pub_->publish(goal_history_);
   goal_pub_->publish(goal);
 }
 

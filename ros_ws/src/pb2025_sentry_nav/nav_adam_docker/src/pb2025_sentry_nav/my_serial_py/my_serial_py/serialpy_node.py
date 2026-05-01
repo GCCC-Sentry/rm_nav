@@ -1501,7 +1501,7 @@ class SerialNode(Node):
         self.running = True
         self.chassis_mode = 0
         self.stance_running_state = 1  # 默认移动姿态 (running_state=1)
-        self.yaw_speed = 0.0  # 来自 /cmd_yaw_speed 的独立 yaw 速度
+        self.yaw_angle = 0.0  # 来自 /cmd_yaw_angle 的独立 yaw 角度
         self.latest_x = 0.0   # 缓存最新 cmd_vel
         self.latest_y = 0.0
 
@@ -1511,7 +1511,7 @@ class SerialNode(Node):
         self.read_thread = threading.Thread(target=self.serial_read_loop, daemon=True)
         self.read_thread.start()
 
-        # 定时发送定时器: 50Hz 合并 cmd_vel + yaw_speed 发送给下位机
+        # 定时发送定时器: 50Hz 合并 cmd_vel + yaw_angle 发送给下位机
         self.send_timer = self.create_timer(0.02, self.periodic_send_to_stm32)
 
         self.get_logger().info(f'✅ 串口节点已启动。当前解析顺序: Type -> Progress -> HP')
@@ -1520,7 +1520,7 @@ class SerialNode(Node):
         self.cmd_vel_sub = self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)
         self.mode_sub = self.create_subscription(Int8, '/cmd_chassis_mode', self.chassis_mode_callback, 10)
         self.stance_sub = self.create_subscription(Float32, '/cmd_stance', self.stance_callback, 10)
-        self.yaw_speed_sub = self.create_subscription(Float32, '/cmd_yaw_speed', self.yaw_speed_callback, 10)
+        self.yaw_angle_sub = self.create_subscription(Float32, '/cmd_yaw_angle', self.yaw_angle_callback, 10)
 
     def create_publishers(self):
         # 使用绝对路径发布话题，供行为树使用
@@ -1622,10 +1622,10 @@ class SerialNode(Node):
     def chassis_mode_callback(self, msg):
         self.chassis_mode = msg.data
 
-    def yaw_speed_callback(self, msg):
-        """接收 region_monitor 发来的独立 yaw_speed (°/s)"""
-        self.yaw_speed = msg.data
-        self.get_logger().debug(f'[yaw_speed] 收到: {msg.data:.1f}')
+    def yaw_angle_callback(self, msg):
+        """接收 region_monitor 发来的独立 yaw 角度 (rad)。"""
+        self.yaw_angle = msg.data
+        self.get_logger().debug(f'[yaw_angle] 收到: {msg.data:.3f}')
 
     def cmd_vel_callback(self, msg):
         """缓存最新的 cmd_vel xy 速度"""
@@ -1644,14 +1644,15 @@ class SerialNode(Node):
                 f'({stance_names.get(new_state, "未知")})')
 
     def periodic_send_to_stm32(self):
-        """定时合并发送: xy来自 cmd_vel缓存, yaw_speed来自 /cmd_yaw_speed"""
+        """定时合并发送: xy来自 cmd_vel缓存, yaw_angle来自 /cmd_yaw_angle"""
         if not (self.serial_conn and self.serial_conn.is_open): return
         try:
             header = 0xAA
             running_state = self.stance_running_state if self.chassis_mode == 0 else self.chassis_mode
             x_val = float(-self.latest_x * 1.0)
             y_val = float(-self.latest_y * 1.0)
-            yaw_val = float(self.yaw_speed)
+            yaw_val = float(self.yaw_angle)
+            # 保持下位机原有 4 个 float 的报文结构不变，只把原 yaw 速度改成 yaw 角度。
             payload = struct.pack('<BffffB', header,
                                   x_val, y_val,
                                   yaw_val, yaw_val,
