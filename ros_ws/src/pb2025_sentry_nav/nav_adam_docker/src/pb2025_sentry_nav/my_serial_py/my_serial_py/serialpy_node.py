@@ -1501,7 +1501,7 @@ class SerialNode(Node):
         self.running = True
         self.chassis_mode = 0
         self.stance_running_state = 1  # 默认移动姿态 (running_state=1)
-        self.yaw_angle = 0.0  # 来自 /cmd_yaw_angle 的独立 yaw 角度
+        self.yaw_angle = 0.0  # 来自 /cmd_yaw_angle 的独立 yaw 角度(单位: deg)
         self.latest_x = 0.0   # 缓存最新 cmd_vel
         self.latest_y = 0.0
 
@@ -1623,7 +1623,7 @@ class SerialNode(Node):
         self.chassis_mode = msg.data
 
     def yaw_angle_callback(self, msg):
-        """接收 region_monitor 发来的独立 yaw 角度 (rad)。"""
+        """接收 region_monitor 发来的独立 yaw 角度 (deg)。"""
         self.yaw_angle = msg.data
         self.get_logger().debug(f'[yaw_angle] 收到: {msg.data:.3f}')
 

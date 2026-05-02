@@ -1,13 +1,15 @@
 import rclpy
 import math
+import time
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from geometry_msgs.msg import Point, PoseStamped, Twist
 from std_msgs.msg import Float32, Int8
 from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
-from sentry_interfaces.msg import EnemyTargetArray
+from auto_aim_interfaces.msg import Target
 
 
 # ================= 颠簸区域配置 =================
@@ -20,10 +22,10 @@ BUMP_ZONES = [
     {
         'name': 'bump_zone_1',
         'vertices': [
-                (-5.77, -3.68),
-                (-5.84, -6.06),
-                (1.07, -6.00),
-                (1.38, -3.96),
+                (-4.77, -3.68),
+                (-4.84, 2.94),
+                (3.07, 2.99),
+                (3.38, -3.96),
         ],
         'target_yaw': 0.0,       # yaw=0 即 map +X 方向
         'forward_speed': 1.0,    # 前进速度 m/s
@@ -43,6 +45,9 @@ BUMP_OVERRIDE_RATE = 50.0
 # 进入颠簸区域时发给 /cmd_chassis_mode 的 running_state 值
 # 注意: running_state=5 专用于颠簸区域底盘 yaw 对齐, 与姿态切换 (1/2/3) 是两套独立逻辑
 BUMP_RUNNING_STATE = 5  # 颠簸区域底盘对齐模式 (非姿态切换)
+BUMP_ALIGN_TOLERANCE_DEG = 3.0
+BUMP_HOLD_SECONDS = 10.0
+BUMP_DRIVE_SPEED = -1.5
 # ================================================
 
 
@@ -53,6 +58,14 @@ def normalize_angle(angle):
     while angle < -math.pi:
         angle += 2.0 * math.pi
     return angle
+
+
+def unwrap_angle(previous_unwrapped, current_wrapped):
+    """将当前 [-pi, pi] 角度展开到连续角度。"""
+    if previous_unwrapped is None:
+        return current_wrapped
+    delta = normalize_angle(current_wrapped - previous_unwrapped)
+    return previous_unwrapped + delta
 
 
 def quaternion_to_yaw(q):
@@ -71,10 +84,10 @@ class RegionMonitorNode(Node):
             {
                 'name': 'patrol_zone_1',
                 'vertices': [
-                    (-1.77, -0.68),
-                    (-1.84, -0.06),
-                    (0.07, -0.01),
-                    (0.38, -.96),
+                    (-5.77, -3.68),
+                    (-5.84, -6.06),
+                    (1.07, -6.00),
+                    (1.38, -3.96),
                 ]
             },
             # 您可以添加更多普通监控区域...
@@ -89,7 +102,7 @@ class RegionMonitorNode(Node):
         self.yaw_angle_pub = self.create_publisher(Float32, '/cmd_yaw_angle', 10)
         self.chassis_mode_pub = self.create_publisher(Int8, '/cmd_chassis_mode', 10)
         self.enemy_targets_sub = self.create_subscription(
-            EnemyTargetArray, '/enemy_targets', self.enemy_targets_callback, 10)
+            Target, '/tracker/target', self.enemy_targets_callback, 10)
         self.goal_pose_sub = self.create_subscription(
             PoseStamped, '/goal_pose', self.goal_pose_callback, 10)
 
@@ -101,10 +114,15 @@ class RegionMonitorNode(Node):
         self.in_region_prev = False        # 普通区域
         self.in_bump_zone = False          # 颠簸区域
         self.active_bump_zone = None       # 当前激活的颠簸区域配置
+        self.start_yaw = None              # 节点启动后首次有效 TF 的起始角度(连续角)
         self.current_yaw = 0.0
+        self.current_yaw_unwrapped = None
         self.latest_enemy_yaw = None
         self.latest_nav_yaw = None
         self.pose_valid = False
+        self.last_yaw_log_time = 0.0
+        self.bump_phase = 'idle'
+        self.bump_hold_start_time = None
 
         # 定时器: 10Hz 检查区域 + 发布可视化
         self.timer = self.create_timer(0.1, self.timer_callback)
@@ -139,6 +157,10 @@ class RegionMonitorNode(Node):
             current_x = t.transform.translation.x
             current_y = t.transform.translation.y
             self.current_yaw = quaternion_to_yaw(t.transform.rotation)
+            self.current_yaw_unwrapped = unwrap_angle(
+                self.current_yaw_unwrapped, self.current_yaw)
+            if self.start_yaw is None:
+                self.start_yaw = self.current_yaw_unwrapped
             self.pose_valid = True
             self._publish_selected_yaw()
 
@@ -209,8 +231,10 @@ class RegionMonitorNode(Node):
         self.get_logger().warn(
             f'>>> 进入颠簸区域 [{zone["name"]}]! '
             f'强制 running_state={BUMP_RUNNING_STATE}, '
-            f'x={zone["forward_speed"]}, y=0, '
-            f'当前yaw={math.degrees(self.current_yaw):.1f}°')
+            f'yaw 接近 0° 持续 {BUMP_HOLD_SECONDS:.1f}s 后, 再以 {BUMP_DRIVE_SPEED:.1f}m/s 前进, '
+            f'启动基准角=0.0°')
+        self.bump_phase = 'aligning'
+        self.bump_hold_start_time = None
 
         # 发布 running_state 切换
         mode_msg = Int8()
@@ -225,6 +249,8 @@ class RegionMonitorNode(Node):
     def _on_leave_bump_zone(self):
         """离开颠簸区域: 停止覆盖, 恢复底盘模式"""
         self.get_logger().info('<<< 离开颠簸区域, 恢复正常控制')
+        self.bump_phase = 'idle'
+        self.bump_hold_start_time = None
 
         # 停止覆盖定时器
         if self.bump_override_timer is not None:
@@ -246,18 +272,34 @@ class RegionMonitorNode(Node):
         if not self.in_bump_zone or self.active_bump_zone is None:
             return
 
-        zone = self.active_bump_zone
+        current_yaw_deg = 0.0
+        if self.start_yaw is not None and self.current_yaw_unwrapped is not None:
+            current_yaw_deg = math.degrees(self.current_yaw_unwrapped - self.start_yaw)
 
-        # 颠簸区域: 发布前进速度通过 cmd_vel, yaw 由独立角度话题发
-        twist = Twist()
-        twist.linear.x = zone['forward_speed']
-        twist.linear.y = 0.0
-        twist.angular.z = 0.0
-        self.cmd_vel_pub.publish(twist)
+        if self.bump_phase == 'aligning':
+            if abs(current_yaw_deg) <= BUMP_ALIGN_TOLERANCE_DEG:
+                if self.bump_hold_start_time is None:
+                    self.bump_hold_start_time = time.time()
+                    self.get_logger().info(
+                        f'[BUMP] yaw 已接近 0° ({current_yaw_deg:.1f}°), 开始连续计时 {BUMP_HOLD_SECONDS:.1f}s')
+                elif time.time() - self.bump_hold_start_time >= BUMP_HOLD_SECONDS:
+                    self.bump_phase = 'driving'
+                    self.get_logger().info(
+                        f'[BUMP] yaw 连续稳定 {BUMP_HOLD_SECONDS:.1f}s，开始直行，速度 {BUMP_DRIVE_SPEED:.1f}m/s')
+            else:
+                if self.bump_hold_start_time is not None:
+                    self.get_logger().info(
+                        f'[BUMP] yaw 偏离 0° ({current_yaw_deg:.1f}°), 连续计时清零')
+                self.bump_hold_start_time = None
+
+        if self.bump_phase == 'driving':
+            twist = Twist()
+            twist.linear.x = BUMP_DRIVE_SPEED
+            twist.linear.y = 0.0
+            twist.angular.z = 0.0
+            self.cmd_vel_pub.publish(twist)
 
         self._publish_selected_yaw()
-
-        self.cmd_vel_pub.publish(twist)
 
         # 持续刷新 running_state (确保串口节点保持 running_state=5)
         mode_msg = Int8()
@@ -265,9 +307,9 @@ class RegionMonitorNode(Node):
         self.chassis_mode_pub.publish(mode_msg)
 
     def enemy_targets_callback(self, msg):
-        if not msg.targets:
+        if not msg.tracking:
             return
-        self.latest_enemy_yaw = float(msg.targets[0].yaw)
+        self.latest_enemy_yaw = float(msg.yaw)
 
     def goal_pose_callback(self, msg):
         self.latest_nav_yaw = quaternion_to_yaw(msg.pose.orientation)
@@ -277,16 +319,48 @@ class RegionMonitorNode(Node):
             selected_yaw = self.latest_nav_yaw
             if selected_yaw is None and self.active_bump_zone is not None:
                 selected_yaw = float(self.active_bump_zone['target_yaw'])
+            yaw_source = 'bump_nav'
         else:
             selected_yaw = self.latest_enemy_yaw
+            yaw_source = 'enemy'
             if selected_yaw is None:
                 selected_yaw = self.latest_nav_yaw
+                yaw_source = 'nav'
 
         if selected_yaw is None:
             selected_yaw = self.current_yaw
+            yaw_source = 'current'
+
+        selected_yaw = float(normalize_angle(selected_yaw))
+        current_yaw_relative = None
+        sent_yaw_deg = None
+        yaw_delta = None
+        if self.start_yaw is not None and self.current_yaw_unwrapped is not None:
+            current_yaw_relative = float(self.current_yaw_unwrapped - self.start_yaw)
+            yaw_delta = float(-current_yaw_relative)
+        if self.in_bump_zone:
+            if yaw_delta is not None:
+                sent_yaw_deg = float(math.degrees(normalize_angle(yaw_delta)))
+        elif self.start_yaw is not None:
+            sent_yaw_deg = float(math.degrees(normalize_angle(selected_yaw - self.start_yaw)))
+        running_state = BUMP_RUNNING_STATE if self.in_bump_zone else 0
+        now = time.time()
+        if now - self.last_yaw_log_time >= 0.5:
+            self.last_yaw_log_time = now
+            start_yaw_str = 'None' if self.start_yaw is None else '0.0'
+            current_yaw_str = (
+                'None' if current_yaw_relative is None
+                else f'{math.degrees(current_yaw_relative):.1f}'
+            )
+            yaw_delta_str = 'None' if yaw_delta is None else f'{math.degrees(yaw_delta):.1f}'
+            sent_yaw_str = 'None' if sent_yaw_deg is None else f'{sent_yaw_deg:.1f}'
+            self.get_logger().info(
+                f'[CMD_YAW] running_state={running_state}, source={yaw_source}, '
+                f'start={start_yaw_str} deg, current={current_yaw_str} deg, '
+                f'delta={yaw_delta_str} deg, sent={sent_yaw_str} deg')
 
         yaw_msg = Float32()
-        yaw_msg.data = float(normalize_angle(selected_yaw))
+        yaw_msg.data = 0.0 if sent_yaw_deg is None else sent_yaw_deg
         self.yaw_angle_pub.publish(yaw_msg)
 
     # ================= 可视化辅助 =================
@@ -326,11 +400,12 @@ def main(args=None):
     node = RegionMonitorNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
