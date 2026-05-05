@@ -34,5 +34,5 @@ pb2025_sentry_behavior_client:
     #   rmul/ → rmul_2026_patrol
     #   rmuc/ → rmuc_2025_with_stance
     # ═══════════════════════════════════════════════════════════
-    target_tree: rmul_2026_patrol
+    target_tree: rmul_2026_center_spin
     # target_tree: rmuc_2025_with_stance

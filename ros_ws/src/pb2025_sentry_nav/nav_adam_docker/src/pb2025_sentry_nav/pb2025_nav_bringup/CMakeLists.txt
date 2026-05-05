@@ -13,12 +13,18 @@ find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
 endif()
 
-ament_auto_package(
-  INSTALL_TO_SHARE
-  launch
-  map
-  pcd
-  config
-  behavior_trees
-  rviz
+install(
+  DIRECTORY
+    launch
+    map
+    pcd
+    config
+    behavior_trees
+    rviz
+  DESTINATION share/${PROJECT_NAME}
+  PATTERN "install" EXCLUDE
+  PATTERN "log" EXCLUDE
+  PATTERN "__pycache__" EXCLUDE
 )
+
+ament_auto_package()

@@ -22,6 +22,9 @@ def generate_launch_description():
         remappings=[
             # 自瞄发来的目标信息
             ('auto_aim_target_pos', 'auto_aim_target_pos'),
+            # 裁判系统状态
+            ('pursuit/robot_status', 'referee/robot_status'),
+            ('pursuit/game_status', 'referee/game_status'),
             # 导航代价地图
             ('global_costmap/costmap', 'global_costmap/costmap'),
             # 发出的导航目标
@@ -29,6 +32,7 @@ def generate_launch_description():
             # 单独可视化的目标点和攻击点
             ('pursuit_target_pose', 'pursuit_target_pose'),
             ('pursuit_attack_pose', 'pursuit_attack_pose'),
+            ('pursuit_nav_goal_pose', 'pursuit_nav_goal_pose'),
             # 追击状态
             ('pursuit_status', 'pursuit_status'),
             # RViz 调试可视化

@@ -1,9 +1,16 @@
 #include "pursuit_decision/pursuit_node.hpp"
 
 #include <algorithm>
+#include <arpa/inet.h>
+#include <cerrno>
 #include <cmath>
+#include <cstring>
+#include <fcntl.h>
 #include <nlohmann/json.hpp>
+#include <netinet/in.h>
 #include <sstream>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "tf2/utils.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
@@ -52,6 +59,8 @@ PursuitNode::PursuitNode(const rclcpp::NodeOptions & options)
     "pursuit_target_pose", 10);
   attack_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
     "pursuit_attack_pose", 10);
+  nav_goal_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+    "pursuit_nav_goal_pose", 10);
 
   pursuit_status_pub_ = this->create_publisher<std_msgs::msg::String>(
     "pursuit_status", 10);
@@ -78,6 +87,10 @@ PursuitNode::PursuitNode(const rclcpp::NodeOptions & options)
     params_.enable_zone_check ? "开" : "关");
 
   goal_history_.header.frame_id = params_.map_frame_id;
+  active_global_frame_id_ = params_.map_frame_id;
+  if (params_.udp_enabled) {
+    setup_udp_socket();
+  }
 }
 
 // ============================================================
@@ -102,8 +115,14 @@ void PursuitNode::declare_and_load_parameters()
   // 坐标系
   this->declare_parameter("map_frame_id", params_.map_frame_id);
   this->declare_parameter("robot_frame_id", params_.robot_frame_id);
+  this->declare_parameter("fallback_map_frame_id", params_.fallback_map_frame_id);
+  this->declare_parameter("fallback_robot_frame_id", params_.fallback_robot_frame_id);
   this->declare_parameter("transform_tolerance", params_.transform_tolerance);
   this->declare_parameter("world_to_map_yaw_offset", params_.world_to_map_yaw_offset);
+  this->declare_parameter("robot_frame_yaw_offset", params_.robot_frame_yaw_offset);
+  this->declare_parameter("udp_enabled", params_.udp_enabled);
+  this->declare_parameter("udp_bind_ip", params_.udp_bind_ip);
+  this->declare_parameter("udp_port", params_.udp_port);
 
   // 噪声控制
   this->declare_parameter("pnp_noise_threshold", params_.pnp_noise_threshold);
@@ -139,8 +158,14 @@ void PursuitNode::declare_and_load_parameters()
   this->get_parameter("hp_retreat_threshold", params_.hp_retreat_threshold);
   this->get_parameter("map_frame_id", params_.map_frame_id);
   this->get_parameter("robot_frame_id", params_.robot_frame_id);
+  this->get_parameter("fallback_map_frame_id", params_.fallback_map_frame_id);
+  this->get_parameter("fallback_robot_frame_id", params_.fallback_robot_frame_id);
   this->get_parameter("transform_tolerance", params_.transform_tolerance);
   this->get_parameter("world_to_map_yaw_offset", params_.world_to_map_yaw_offset);
+  this->get_parameter("robot_frame_yaw_offset", params_.robot_frame_yaw_offset);
+  this->get_parameter("udp_enabled", params_.udp_enabled);
+  this->get_parameter("udp_bind_ip", params_.udp_bind_ip);
+  this->get_parameter("udp_port", params_.udp_port);
   this->get_parameter("pnp_noise_threshold", params_.pnp_noise_threshold);
   this->get_parameter("max_position_jump", params_.max_position_jump);
   this->get_parameter("z_layer_tolerance", params_.z_layer_tolerance);
@@ -253,12 +278,78 @@ void PursuitNode::initialize_zones()
 
 void PursuitNode::on_aim_target(const std_msgs::msg::String::SharedPtr msg)
 {
+  process_aim_target_payload(msg->data, "ros2");
+}
+
+bool PursuitNode::setup_udp_socket()
+{
+  udp_socket_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+  if (udp_socket_fd_ < 0) {
+    RCLCPP_WARN(this->get_logger(), "UDP socket 创建失败: %s", std::strerror(errno));
+    return false;
+  }
+
+  int flags = fcntl(udp_socket_fd_, F_GETFL, 0);
+  if (flags >= 0) {
+    (void)fcntl(udp_socket_fd_, F_SETFL, flags | O_NONBLOCK);
+  }
+
+  int reuse = 1;
+  (void)setsockopt(udp_socket_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+  sockaddr_in addr {};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(params_.udp_port));
+  if (params_.udp_bind_ip == "0.0.0.0") {
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+  } else if (inet_pton(AF_INET, params_.udp_bind_ip.c_str(), &addr.sin_addr) != 1) {
+    RCLCPP_WARN(this->get_logger(), "UDP bind ip 无效: %s", params_.udp_bind_ip.c_str());
+    ::close(udp_socket_fd_);
+    udp_socket_fd_ = -1;
+    return false;
+  }
+
+  if (::bind(udp_socket_fd_, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+    RCLCPP_WARN(
+      this->get_logger(), "UDP bind %s:%d 失败: %s",
+      params_.udp_bind_ip.c_str(), params_.udp_port, std::strerror(errno));
+    ::close(udp_socket_fd_);
+    udp_socket_fd_ = -1;
+    return false;
+  }
+
+  RCLCPP_INFO(
+    this->get_logger(), "UDP pursuit target listener 已启动: %s:%d",
+    params_.udp_bind_ip.c_str(), params_.udp_port);
+  return true;
+}
+
+void PursuitNode::poll_udp_targets()
+{
+  if (udp_socket_fd_ < 0) {
+    return;
+  }
+
+  char buffer[512];
+  while (true) {
+    ssize_t n = ::recvfrom(udp_socket_fd_, buffer, sizeof(buffer) - 1, 0, nullptr, nullptr);
+    if (n <= 0) {
+      break;
+    }
+    buffer[n] = '\0';
+    process_aim_target_payload(std::string(buffer), "udp");
+  }
+}
+
+void PursuitNode::process_aim_target_payload(const std::string & payload, const char * source_tag)
+{
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-    "[收到自瞄数据] raw: '%s'", msg->data.c_str());
+    "[收到自瞄数据][%s] raw: '%s'", source_tag, payload.c_str());
 
   // 解析格式: "x,y,z,armor_id,tracking_state"
-  // 兼容旧格式: "x,y,1,armor_id"
-  std::stringstream ss(msg->data);
+  // 当前协议语义: gimbal_x,gimbal_y,gimbal_z,armor_id,tracking_state
+  // 兼容旧格式: "x,y,z,armor_id" (tracking_state 默认=1)
+  std::stringstream ss(payload);
   std::string token;
   std::vector<double> values;
 
@@ -267,51 +358,70 @@ void PursuitNode::on_aim_target(const std_msgs::msg::String::SharedPtr msg)
       values.push_back(std::stod(token));
     } catch (...) {
       RCLCPP_WARN(this->get_logger(),
-        "[自瞄数据] 解析失败, token='%s', raw='%s'", token.c_str(), msg->data.c_str());
+        "[自瞄数据][%s] 解析失败, token='%s', raw='%s'",
+        source_tag, token.c_str(), payload.c_str());
       return;  // 解析失败
     }
   }
 
   if (values.size() < 4) {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "[自瞄数据] 字段不足: size=%zu, 需要>=4, raw='%s'",
-      values.size(), msg->data.c_str());
+      "[自瞄数据][%s] 字段不足: size=%zu, 需要>=4, raw='%s'",
+      source_tag, values.size(), payload.c_str());
     return;
   }
 
-  // 格式A (5字段): "world_x,world_y,world_z,armor_id,tracking_state"
-  // 格式B (4字段): "world_x,world_y,world_z,armor_id" (tracking_state默认=1)
-  double world_x = values[0];
-  double world_y = values[1];
-  double world_z = (values.size() >= 4) ? values[2] : 0.0;
+  double gimbal_x = values[0];
+  double gimbal_y = values[1];
+  double gimbal_z = (values.size() >= 4) ? values[2] : 0.0;
   int armor_id = (values.size() >= 5)
     ? static_cast<int>(std::round(values[3]))
     : static_cast<int>(std::round(values[values.size() - 1]));
   int tracking_state = (values.size() >= 5) ? static_cast<int>(std::round(values[4])) : 1;
 
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-    "[自瞄数据] 解析结果: world=(%.3f, %.3f, %.3f), armor_id=%d, tracking_state=%d",
-    world_x, world_y, world_z, armor_id, tracking_state);
+    "[自瞄数据] 解析结果: gimbal=(%.3f, %.3f, %.3f), armor_id=%d, tracking_state=%d",
+    gimbal_x, gimbal_y, gimbal_z, armor_id, tracking_state);
 
   // 全零意味着没有有效目标
-  if (std::abs(world_x) < 1e-6 && std::abs(world_y) < 1e-6 && armor_id == 0) {
-    RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "[自瞄数据] 全零数据, 忽略");
+  if (std::abs(gimbal_x) < 1e-6 && std::abs(gimbal_y) < 1e-6 && armor_id == 0) {
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+      "[自瞄数据][%s] 收到全零数据，判定为目标丢失，清空观测并停止追击", source_tag);
+    target_validator_.reset();
+    has_last_raw_target_map_ = false;
+    last_candidate_points_.clear();
+    has_last_goal_ = false;
+    if (state_ != PursuitState::IDLE) {
+      transition_to(PursuitState::IDLE);
+    }
+
+    double rx, ry, rz;
+    if (get_robot_position(rx, ry, rz)) {
+      geometry_msgs::msg::PoseStamped hold_goal;
+      hold_goal.header.frame_id = active_global_frame_id_;
+      hold_goal.header.stamp = this->now();
+      hold_goal.pose.position.x = rx;
+      hold_goal.pose.position.y = ry;
+      hold_goal.pose.position.z = 0.0;
+      hold_goal.pose.orientation.w = 1.0;
+      goal_pub_->publish(hold_goal);
+      nav_goal_pose_pub_->publish(hold_goal);
+    }
     return;
   }
 
-  // 将IMU世界坐标系下的相对向量转换到map frame下的绝对位置
-  // 不依赖动态云台TF, 解决宿主机auto_aim与Docker容器导航的解耦问题
+  // 将云台/小yaw局部坐标系下的相对向量转换到导航全局系下的绝对位置。
+  // 这里显式使用实时 gimbal_yaw TF，双yaw结构下会自动带上大yaw/小yaw的动态相对角。
   double mx, my, mz;
-  if (!world_vector_to_map(world_x, world_y, world_z, mx, my, mz)) {
+  if (!gimbal_vector_to_map(gimbal_x, gimbal_y, gimbal_z, mx, my, mz)) {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "[自瞄数据] world_vector_to_map失败, 可能TF不可用");
+      "[自瞄数据][%s] gimbal_vector_to_map失败, 可能TF不可用", source_tag);
     return;
   }
 
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-    "[坐标转换] world(%.3f,%.3f,%.3f) -> map(%.3f,%.3f,%.3f)",
-    world_x, world_y, world_z, mx, my, mz);
+    "[坐标转换] gimbal(%.3f,%.3f,%.3f) -> map(%.3f,%.3f,%.3f)",
+    gimbal_x, gimbal_y, gimbal_z, mx, my, mz);
 
   has_last_raw_target_map_ = true;
   last_raw_target_map_.x = mx;
@@ -329,8 +439,10 @@ void PursuitNode::on_aim_target(const std_msgs::msg::String::SharedPtr msg)
 
   target_validator_.add_observation(obs);
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-    "[验证器] 已添加观测, confirmed=%s, confirmed_id=%d, time_since_last=%.2fs",
+    "[验证器] 已处理观测, result='%s', confirmed=%s, reason='%s', confirmed_id=%d, time_since_last=%.2fs",
+    target_validator_.last_observation_status().c_str(),
     target_validator_.is_confirmed() ? "YES" : "NO",
+    target_validator_.explain_confirmation_status().c_str(),
     target_validator_.get_confirmed_target_id(),
     target_validator_.time_since_last_observation());
 }
@@ -376,6 +488,8 @@ void PursuitNode::on_costmap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
 
 void PursuitNode::decision_callback()
 {
+  poll_udp_targets();
+
   // 每5秒打印一次当前总体状态
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
     "[决策循环] 当前状态=%d(%s), game_progress=%d, 目标confirmed=%s, confirmed_id=%d, hp=%.0f",
@@ -407,12 +521,15 @@ void PursuitNode::decision_callback()
       bool has_pos = target_validator_.get_filtered_position(tx, ty, tz);
 
       RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-        "[IDLE] confirmed=%s, has_filtered_pos=%s%s",
+        "[IDLE] confirmed=%s, reason='%s', has_filtered_pos=%s%s",
         confirmed ? "YES" : "NO",
+        target_validator_.explain_confirmation_status().c_str(),
         has_pos ? "YES" : "NO",
         has_pos ? (std::string(" pos=(" + std::to_string(tx) + "," + std::to_string(ty) + "," + std::to_string(tz) + ")").c_str()) : "");
 
-      if (confirmed && has_pos)
+      // 临时放开 confirmed 门槛，便于现场直接验证追击链路。
+      // 原逻辑: 只有 confirmed && has_pos 才能进入 should_start_pursuit。
+      if (has_pos)
       {
         if (should_start_pursuit(tx, ty, tz)) {
           RCLCPP_INFO(this->get_logger(),
@@ -430,13 +547,16 @@ void PursuitNode::decision_callback()
       bool still_confirmed = target_validator_.is_confirmed();
       bool still_has_pos = target_validator_.get_filtered_position(tx, ty, tz);
       RCLCPP_INFO(this->get_logger(),
-        "[CONFIRMING] confirmed=%s, has_pos=%s",
-        still_confirmed ? "YES" : "NO", still_has_pos ? "YES" : "NO");
+        "[CONFIRMING] confirmed=%s, reason='%s', has_pos=%s [当前为临时放开模式]",
+        still_confirmed ? "YES" : "NO",
+        target_validator_.explain_confirmation_status().c_str(),
+        still_has_pos ? "YES" : "NO");
 
-      if (!still_confirmed || !still_has_pos)
+      // 临时放开 confirmed 门槛，只要仍然有位置就继续进入 PURSUING。
+      if (!still_has_pos)
       {
         // 确认失败，回到IDLE
-        RCLCPP_WARN(this->get_logger(), "[CONFIRMING] 确认失败, 回到IDLE");
+        RCLCPP_WARN(this->get_logger(), "[CONFIRMING] 无滤波后位置, 回到IDLE");
         transition_to(PursuitState::IDLE);
         break;
       }
@@ -590,7 +710,7 @@ bool PursuitNode::should_start_pursuit(
   double target_x, double target_y, double target_z)
 {
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-    "[追击判断] 开始检查, 目标=(%.2f,%.2f,%.2f)", target_x, target_y, target_z);
+    "[追击判断] 开始检查, 目标=(%.2f,%.2f,%.2f) [当前为临时放开模式]", target_x, target_y, target_z);
 
   // 1. 获取自身位置
   double rx, ry, rz;
@@ -610,19 +730,19 @@ bool PursuitNode::should_start_pursuit(
 
   if (dist > params_.trigger_distance) {
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "[追击判断] ×距离过远: %.2fm > 触发距离%.2fm", dist, params_.trigger_distance);
-    return false;  // 超出追击触发距离
+      "[追击判断][临时放开] 原本会因距离过远而不追击: %.2fm > 触发距离%.2fm，但当前继续追击",
+      dist, params_.trigger_distance);
+  } else {
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+      "[追击判断] √距离检查通过: %.2fm <= %.2fm", dist, params_.trigger_distance);
   }
-  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-    "[追击判断] √距离检查通过: %.2fm <= %.2fm", dist, params_.trigger_distance);
 
   // 3. 图层检查: 必须在同一图层 (可通过参数关闭)
   if (params_.enable_zone_check) {
     if (!zone_manager_.is_same_layer(rx, ry, rz, target_x, target_y, target_z)) {
       RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-        "[追击判断] ×图层不同, 不追击. 自(%.1f,%.1f,%.1f) 敌(%.1f,%.1f,%.1f)",
+        "[追击判断][临时放开] 原本会因图层不同而不追击. 自(%.1f,%.1f,%.1f) 敌(%.1f,%.1f,%.1f)，当前继续追击",
         rx, ry, rz, target_x, target_y, target_z);
-      return false;
     }
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
       "[追击判断] √图层检查通过");
@@ -630,9 +750,8 @@ bool PursuitNode::should_start_pursuit(
     // 4. 禁区检查: 目标不能在禁区
     if (zone_manager_.is_in_forbidden_zone(target_x, target_y)) {
       RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-        "[追击判断] ×目标位于禁区 (%s), 不追击",
+        "[追击判断][临时放开] 原本会因目标位于禁区 (%s) 而不追击，当前继续追击",
         zone_manager_.get_zone_name(target_x, target_y).c_str());
-      return false;
     }
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
       "[追击判断] √禁区检查通过(目标不在禁区)");
@@ -650,8 +769,7 @@ bool PursuitNode::should_start_pursuit(
   double goal_y = target_y + approach_dist * std::sin(angle);
   if (params_.enable_zone_check && zone_manager_.is_in_forbidden_zone(goal_x, goal_y)) {
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "[追击判断] ×追击目标点(%.2f,%.2f)位于禁区, 不追击", goal_x, goal_y);
-    return false;
+      "[追击判断][临时放开] 原本会因追击点(%.2f,%.2f)位于禁区而不追击，当前继续追击", goal_x, goal_y);
   }
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
     "[追击判断] √追击目标点禁区检查通过");
@@ -659,9 +777,8 @@ bool PursuitNode::should_start_pursuit(
   // 6. 自身状态检查: 血量足够
   if (robot_status_.hp <= params_.hp_retreat_threshold) {
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "[追击判断] ×血量不足: %.0f <= 阈值%.0f",
+      "[追击判断][临时放开] 原本会因血量不足而不追击: %.0f <= 阈值%.0f，当前继续追击",
       robot_status_.hp, params_.hp_retreat_threshold);
-    return false;
   }
 
   RCLCPP_INFO(this->get_logger(),
@@ -672,6 +789,9 @@ bool PursuitNode::should_start_pursuit(
 
 bool PursuitNode::should_retreat()
 {
+  // 临时注释掉撤退逻辑，现场调试时始终不因撤退条件退出追击。
+  return false;
+
   // 条件1: 血量低于阈值
   if (robot_status_.hp <= params_.hp_retreat_threshold) {
     RCLCPP_INFO(this->get_logger(),
@@ -719,6 +839,37 @@ bool PursuitNode::should_retreat()
 
 bool PursuitNode::get_robot_position(double & x, double & y, double & z)
 {
+  auto try_lookup =
+    [&](const std::string & target_frame, const std::string & source_frame) -> bool {
+      try {
+        auto transform = tf_buffer_->lookupTransform(
+          target_frame, source_frame,
+          tf2::TimePointZero,
+          tf2::durationFromSec(params_.transform_tolerance));
+
+        x = transform.transform.translation.x;
+        y = transform.transform.translation.y;
+        z = transform.transform.translation.z;
+        active_global_frame_id_ = target_frame;
+        return true;
+      } catch (const tf2::TransformException &) {
+        return false;
+      }
+    };
+
+  if (try_lookup(params_.map_frame_id, params_.robot_frame_id)) {
+    return true;
+  }
+  if (try_lookup(params_.fallback_map_frame_id, params_.robot_frame_id)) {
+    return true;
+  }
+  if (try_lookup(params_.map_frame_id, params_.fallback_robot_frame_id)) {
+    return true;
+  }
+  if (try_lookup(params_.fallback_map_frame_id, params_.fallback_robot_frame_id)) {
+    return true;
+  }
+
   try {
     auto transform = tf_buffer_->lookupTransform(
       params_.map_frame_id, params_.robot_frame_id,
@@ -736,33 +887,52 @@ bool PursuitNode::get_robot_position(double & x, double & y, double & z)
   }
 }
 
-bool PursuitNode::world_vector_to_map(
-  double world_x, double world_y, double world_z,
+bool PursuitNode::gimbal_vector_to_map(
+  double gimbal_x, double gimbal_y, double gimbal_z,
   double & mx, double & my, double & mz)
 {
-  // 获取机器人当前在map frame中的位置
-  // xyz_in_world 是目标相对于云台在IMU世界坐标系下的向量
-  // target_map = robot_map + R(yaw_offset) * xyz_in_world
-  double rx, ry, rz;
-  if (!get_robot_position(rx, ry, rz)) {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "[坐标转换] get_robot_position失败, 无法进行world->map变换");
-    return false;
-  }
+  auto try_lookup =
+    [&](const std::string & target_frame, const std::string & source_frame) -> bool {
+      try {
+        auto transform = tf_buffer_->lookupTransform(
+          target_frame, source_frame,
+          tf2::TimePointZero,
+          tf2::durationFromSec(params_.transform_tolerance));
 
-  // 应用yaw偏移量将IMU世界坐标系向量旋转到map坐标系
-  double cos_off = std::cos(params_.world_to_map_yaw_offset);
-  double sin_off = std::sin(params_.world_to_map_yaw_offset);
+        const double rx = transform.transform.translation.x;
+        const double ry = transform.transform.translation.y;
+        const double rz = transform.transform.translation.z;
+        const double robot_yaw = tf2::getYaw(transform.transform.rotation);
+        const double total_yaw =
+          robot_yaw + params_.robot_frame_yaw_offset + params_.world_to_map_yaw_offset;
+        const double cos_off = std::cos(total_yaw);
+        const double sin_off = std::sin(total_yaw);
 
-  mx = rx + cos_off * world_x - sin_off * world_y;
-  my = ry + sin_off * world_x + cos_off * world_y;
-  mz = rz + world_z;  // z方向近似直接相加 (重力方向一致)
+        // xyz_in_gimbal: x前/y左/z上
+        mx = rx + cos_off * gimbal_x - sin_off * gimbal_y;
+        my = ry + sin_off * gimbal_x + cos_off * gimbal_y;
+        mz = rz + gimbal_z;
+        active_global_frame_id_ = target_frame;
 
-  RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-    "[坐标转换] robot_map=(%.2f,%.2f,%.2f), yaw_offset=%.3f, world_vec=(%.2f,%.2f,%.2f) -> map_target=(%.2f,%.2f,%.2f)",
-    rx, ry, rz, params_.world_to_map_yaw_offset, world_x, world_y, world_z, mx, my, mz);
+        RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+          "[坐标转换] robot_global=(%.2f,%.2f,%.2f), robot_yaw=%.3f, world_to_map_yaw_offset=%.3f, robot_frame_yaw_offset=%.3f, total_yaw=%.3f, gimbal_vec=(%.2f,%.2f,%.2f) -> target_global=(%.2f,%.2f,%.2f)",
+          rx, ry, rz, robot_yaw, params_.world_to_map_yaw_offset,
+          params_.robot_frame_yaw_offset, total_yaw,
+          gimbal_x, gimbal_y, gimbal_z, mx, my, mz);
+        return true;
+      } catch (const tf2::TransformException &) {
+        return false;
+      }
+    };
 
-  return true;
+  if (try_lookup(params_.map_frame_id, params_.robot_frame_id)) return true;
+  if (try_lookup(params_.fallback_map_frame_id, params_.robot_frame_id)) return true;
+  if (try_lookup(params_.map_frame_id, params_.fallback_robot_frame_id)) return true;
+  if (try_lookup(params_.fallback_map_frame_id, params_.fallback_robot_frame_id)) return true;
+
+  RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+    "[坐标转换] 无法获取机器人姿态, 无法进行gimbal->map变换");
+  return false;
 }
 
 // ============================================================
@@ -774,6 +944,7 @@ bool PursuitNode::compute_pursuit_goal(
   double approach_dist,
   geometry_msgs::msg::PoseStamped & goal)
 {
+  (void)approach_dist;
   last_candidate_points_.clear();
 
   double rx, ry, rz;
@@ -781,70 +952,14 @@ bool PursuitNode::compute_pursuit_goal(
     return false;
   }
 
-  // 生成圆形候选点
-  struct Candidate {
-    double x, y;
-    double cost_to_robot;
-  };
-  std::vector<Candidate> feasible;
-
-  for (int i = 0; i < params_.num_candidate_sectors; ++i) {
-    double angle = i * 2.0 * M_PI / params_.num_candidate_sectors;
-    double cx = target_x + approach_dist * std::cos(angle);
-    double cy = target_y + approach_dist * std::sin(angle);
-
-  // 禁区检查
-    if (params_.enable_zone_check) {
-      if (zone_manager_.is_in_forbidden_zone(cx, cy)) continue;
-    }
-
-    // 代价地图检查 (仅在有costmap时)
-    if (costmap_) {
-      const auto & info = costmap_->info;
-      int cell_x = static_cast<int>((cx - info.origin.position.x) / info.resolution);
-      int cell_y = static_cast<int>((cy - info.origin.position.y) / info.resolution);
-
-      if (cell_x >= 0 && cell_x < static_cast<int>(info.width) &&
-          cell_y >= 0 && cell_y < static_cast<int>(info.height))
-      {
-        int idx = cell_y * info.width + cell_x;
-        int8_t cost = costmap_->data[idx];
-        if (cost < 0 || cost > params_.costmap_cost_threshold) {
-          continue;  // 不可通行
-        }
-      }
-    }
-
-    double dx = cx - rx;
-    double dy = cy - ry;
-    geometry_msgs::msg::Point candidate_point;
-    candidate_point.x = cx;
-    candidate_point.y = cy;
-    candidate_point.z = 0.0;
-    last_candidate_points_.push_back(candidate_point);
-    feasible.push_back({cx, cy, std::sqrt(dx * dx + dy * dy)});
-  }
-
-  if (feasible.empty()) {
-    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "没有可行的追击候选点");
-    return false;
-  }
-
-  // 选择离机器人最近的可行点
-  auto best = std::min_element(feasible.begin(), feasible.end(),
-    [](const Candidate & a, const Candidate & b) {
-      return a.cost_to_robot < b.cost_to_robot;
-    });
-
-  // 构造PoseStamped, 朝向敌人
-  goal.header.frame_id = params_.map_frame_id;
+  // 直接把敌人点作为导航点，先排除候选圈选点策略的干扰。
+  goal.header.frame_id = active_global_frame_id_;
   goal.header.stamp = this->now();
-  goal.pose.position.x = best->x;
-  goal.pose.position.y = best->y;
+  goal.pose.position.x = target_x;
+  goal.pose.position.y = target_y;
   goal.pose.position.z = 0.0;
 
-  double yaw = std::atan2(target_y - best->y, target_x - best->x);
+  double yaw = std::atan2(target_y - ry, target_x - rx);
   tf2::Quaternion q;
   q.setRPY(0, 0, yaw);
   goal.pose.orientation = tf2::toMsg(q);
@@ -886,9 +1001,10 @@ void PursuitNode::transition_to(PursuitState new_state)
 
   if (new_state == PursuitState::IDLE) {
     current_pursuit_target_id_ = -1;
-    // 不刍调用 reset()! 保留validator buffer,
-    // 否则会丢失当前观测数据导致反复 IDLE<->CONFIRMING振荡
-    // target_validator_.reset(); 
+    target_validator_.reset();
+    has_last_goal_ = false;
+    has_last_raw_target_map_ = false;
+    last_candidate_points_.clear();
   }
 
   state_ = new_state;
@@ -934,14 +1050,14 @@ void PursuitNode::publish_debug_visualization()
   visualization_msgs::msg::MarkerArray markers;
   auto now = this->now();
   geometry_msgs::msg::PoseStamped target_pose_msg;
-  target_pose_msg.header.frame_id = params_.map_frame_id;
+  target_pose_msg.header.frame_id = active_global_frame_id_;
   target_pose_msg.header.stamp = now;
 
   auto make_marker =
     [&](int id, int type, double scale_x, double scale_y, double scale_z,
         double r, double g, double b, double a) {
       visualization_msgs::msg::Marker marker;
-      marker.header.frame_id = params_.map_frame_id;
+      marker.header.frame_id = active_global_frame_id_;
       marker.header.stamp = now;
       marker.ns = "pursuit_debug";
       marker.id = id;
@@ -959,9 +1075,9 @@ void PursuitNode::publish_debug_visualization()
     };
 
   auto append_delete_markers = [&]() {
-    for (int id = 0; id < 12; ++id) {
+    for (int id = 0; id < 13; ++id) {
       visualization_msgs::msg::Marker marker;
-      marker.header.frame_id = params_.map_frame_id;
+      marker.header.frame_id = active_global_frame_id_;
       marker.header.stamp = now;
       marker.ns = "pursuit_debug";
       marker.id = id;
@@ -1043,13 +1159,6 @@ void PursuitNode::publish_debug_visualization()
     line.points.push_back(end);
     markers.markers.push_back(line);
 
-    auto label = make_marker(10, visualization_msgs::msg::Marker::TEXT_VIEW_FACING,
-      0.0, 0.0, 0.32, 1.0, 0.25, 0.25, 1.0);
-    label.pose.position.x = tx;
-    label.pose.position.y = ty;
-    label.pose.position.z = tz + 0.45;
-    label.text = "enemy target";
-    markers.markers.push_back(label);
   } else {
     for (int id : {3, 4, 10}) {
       auto marker = make_marker(id, visualization_msgs::msg::Marker::SPHERE,
@@ -1059,12 +1168,7 @@ void PursuitNode::publish_debug_visualization()
     }
   }
 
-  if (!last_candidate_points_.empty()) {
-    auto marker = make_marker(5, visualization_msgs::msg::Marker::POINTS,
-      0.12, 0.12, 0.0, 0.1, 0.9, 1.0, 0.95);
-    marker.points = last_candidate_points_;
-    markers.markers.push_back(marker);
-  } else {
+  {
     auto marker = make_marker(5, visualization_msgs::msg::Marker::POINTS,
       0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     marker.action = visualization_msgs::msg::Marker::DELETE;
@@ -1072,81 +1176,20 @@ void PursuitNode::publish_debug_visualization()
   }
 
   if (has_last_goal_) {
-    attack_pose_pub_->publish(last_goal_);
+    nav_goal_pose_pub_->publish(last_goal_);
+  }
 
-    auto marker = make_marker(6, visualization_msgs::msg::Marker::ARROW,
-      0.55, 0.14, 0.14, 0.15, 0.35, 1.0, 1.0);
-    marker.pose = last_goal_.pose;
-    markers.markers.push_back(marker);
-
-    auto point_marker = make_marker(8, visualization_msgs::msg::Marker::CYLINDER,
-      0.45, 0.45, 0.12, 0.15, 0.35, 1.0, 0.9);
-    point_marker.pose.position = last_goal_.pose.position;
-    markers.markers.push_back(point_marker);
-
-    if (has_filtered_target) {
-      auto line = make_marker(9, visualization_msgs::msg::Marker::LINE_STRIP,
-        0.06, 0.0, 0.0, 1.0, 0.35, 0.35, 0.85);
-      geometry_msgs::msg::Point target_point;
-      target_point.x = tx;
-      target_point.y = ty;
-      target_point.z = tz;
-      geometry_msgs::msg::Point attack_point;
-      attack_point.x = last_goal_.pose.position.x;
-      attack_point.y = last_goal_.pose.position.y;
-      attack_point.z = last_goal_.pose.position.z;
-      line.points.push_back(target_point);
-      line.points.push_back(attack_point);
-      markers.markers.push_back(line);
-    }
-
-    auto label = make_marker(11, visualization_msgs::msg::Marker::TEXT_VIEW_FACING,
-      0.0, 0.0, 0.32, 0.15, 0.35, 1.0, 1.0);
-    label.pose.position.x = last_goal_.pose.position.x;
-    label.pose.position.y = last_goal_.pose.position.y;
-    label.pose.position.z = last_goal_.pose.position.z + 0.4;
-    label.text = "selected attack point";
-    markers.markers.push_back(label);
-  } else {
-    auto marker = make_marker(6, visualization_msgs::msg::Marker::ARROW,
+  for (int id : {6, 8, 9, 11, 12}) {
+    auto marker = make_marker(id, visualization_msgs::msg::Marker::SPHERE,
       0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     marker.action = visualization_msgs::msg::Marker::DELETE;
     markers.markers.push_back(marker);
-    auto point_marker = make_marker(8, visualization_msgs::msg::Marker::CYLINDER,
-      0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    point_marker.action = visualization_msgs::msg::Marker::DELETE;
-    markers.markers.push_back(point_marker);
-    auto line = make_marker(9, visualization_msgs::msg::Marker::LINE_STRIP,
-      0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    line.action = visualization_msgs::msg::Marker::DELETE;
-    markers.markers.push_back(line);
-    auto label = make_marker(11, visualization_msgs::msg::Marker::TEXT_VIEW_FACING,
-      0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    label.action = visualization_msgs::msg::Marker::DELETE;
-    markers.markers.push_back(label);
   }
 
   {
     auto marker = make_marker(7, visualization_msgs::msg::Marker::TEXT_VIEW_FACING,
-      0.0, 0.0, 0.45, 1.0, 1.0, 1.0, 1.0);
-    marker.pose.position.x = rx;
-    marker.pose.position.y = ry;
-    marker.pose.position.z = rz + 1.0;
-
-    std::ostringstream oss;
-    oss << "state=";
-    switch (state_) {
-      case PursuitState::IDLE: oss << "IDLE"; break;
-      case PursuitState::CONFIRMING: oss << "CONFIRMING"; break;
-      case PursuitState::PURSUING: oss << "PURSUING"; break;
-      case PursuitState::RETREATING: oss << "RETREATING"; break;
-    }
-    oss << " target_id=" << current_pursuit_target_id_;
-    oss << " hp=" << static_cast<int>(robot_status_.hp);
-    if (has_filtered_target) {
-      oss << " target=(" << tx << "," << ty << "," << tz << ")";
-    }
-    marker.text = oss.str();
+      0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    marker.action = visualization_msgs::msg::Marker::DELETE;
     markers.markers.push_back(marker);
   }
 
@@ -1156,7 +1199,7 @@ void PursuitNode::publish_debug_visualization()
 void PursuitNode::publish_retreat_goal()
 {
   geometry_msgs::msg::PoseStamped goal;
-  goal.header.frame_id = params_.map_frame_id;
+  goal.header.frame_id = active_global_frame_id_;
   goal.header.stamp = this->now();
   goal.pose.position.x = params_.retreat_x;
   goal.pose.position.y = params_.retreat_y;

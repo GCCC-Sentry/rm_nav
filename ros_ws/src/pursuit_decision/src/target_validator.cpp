@@ -24,6 +24,7 @@ void TargetValidator::add_observation(const TargetObservation & obs)
 
   // 只接受tracking状态 (state=2) 或 detecting状态 (state=1) 的观测
   if (obs.tracking_state < 1) {
+    last_observation_status_ = "丢弃: tracking_state < 1";
     return;
   }
 
@@ -35,6 +36,7 @@ void TargetValidator::add_observation(const TargetObservation & obs)
     if (obs.armor_id != last.armor_id) {
       buffer_.clear();
       confirmed_target_id_ = -1;
+      last_observation_status_ = "目标ID切换，已重置buffer";
     } else {
       // 检查位置跳变
       double dx = obs.x - last.x;
@@ -44,12 +46,14 @@ void TargetValidator::add_observation(const TargetObservation & obs)
 
       if (dist > max_position_jump_) {
         // 跳变过大，可能是PnP误差或目标切换，不加入buffer
+        last_observation_status_ = "丢弃: 帧间跳变过大";
         return;
       }
     }
   }
 
   buffer_.push_back(obs);
+  last_observation_status_ = "已加入buffer";
 
   // 保持buffer大小不超过2倍确认帧数
   while (static_cast<int>(buffer_.size()) > confirm_frames_ * 2) {
@@ -59,8 +63,14 @@ void TargetValidator::add_observation(const TargetObservation & obs)
 
 bool TargetValidator::is_confirmed() const
 {
+  return explain_confirmation_status() == "confirmed";
+}
+
+std::string TargetValidator::explain_confirmation_status() const
+{
   if (static_cast<int>(buffer_.size()) < confirm_frames_) {
-    return false;
+    return "连续有效帧不足: " + std::to_string(buffer_.size()) + "/" +
+           std::to_string(confirm_frames_);
   }
 
   // 检查最近N帧是否一致
@@ -77,7 +87,8 @@ bool TargetValidator::is_confirmed() const
   }
 
   if (consistent_count < confirm_frames_) {
-    return false;
+    return "最近确认窗口内 armor_id 不一致或 tracking_state 失效: " +
+           std::to_string(consistent_count) + "/" + std::to_string(confirm_frames_);
   }
 
   // 检查确认窗口内的时间跨度不超过超时
@@ -87,7 +98,8 @@ bool TargetValidator::is_confirmed() const
     std::chrono::duration<double>(newest - oldest_in_window).count();
 
   if (time_span > confirm_timeout_sec_) {
-    return false;  // 帧率太低，不可信
+    return "确认时间窗过长: " + std::to_string(time_span) + "s > " +
+           std::to_string(confirm_timeout_sec_) + "s";
   }
 
   // 检查位置一致性 (噪声检查)
@@ -119,10 +131,11 @@ bool TargetValidator::is_confirmed() const
 
   // 如果位置标准差过大，说明目标不稳定
   if (spatial_std > noise_threshold_) {
-    return false;
+    return "位置抖动过大: spatial_std=" + std::to_string(spatial_std) + " > " +
+           std::to_string(noise_threshold_);
   }
 
-  return true;
+  return "confirmed";
 }
 
 int TargetValidator::get_confirmed_target_id() const

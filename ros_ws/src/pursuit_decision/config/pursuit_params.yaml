@@ -39,19 +39,27 @@ pursuit_decision:
     # ====== 坐标系配置 ======
     # 自瞄运行在宿主机, 导航(含pursuit)运行在Docker容器
     # 两者通过 --network host 的ROS2 DDS通信
-    # 自瞄发布的是IMU世界坐标系下的相对向量(xyz_in_world)
-    # 不依赖动态云台TF, 仅需一个静态yaw偏移量即可转换到map frame
+    # 自瞄现在发布的是云台/小yaw局部坐标系下的相对向量(xyz_in_gimbal)
+    # 导航端使用实时 gimbal_yaw TF 把它变到 odom/map，适配双yaw结构
 
-    map_frame_id: "map"            # 导航全局坐标系
-    robot_frame_id: "chassis"      # 机器人底盘坐标系
+    map_frame_id: "odom"            # 当前现场可用的全局参考系
+    robot_frame_id: "gimbal_yaw"    # 必须是小yaw对应的动态TF frame
+    fallback_map_frame_id: "map"    # 如果后续 map->odom 打通, 优先切回 map
+    fallback_robot_frame_id: "base_footprint"
 
-    # IMU世界坐标系 → map坐标系 的yaw偏移量 (rad)
-    # 两者共享重力方向(z轴), 仅差一个绕Z轴的旋转
-    # 标定方法: 将机器人放在已知位置, offset = map_yaw - imu_world_yaw
-    # 如果Point-LIO定位系统使用IMU作为方向参考, 此值通常接近0
+    # gimbal局部系 -> 导航全局系 的静态修正量 (rad)
+    # 主旋转由实时 robot_yaw(TF) 提供；这里的两个参数只保留给外参/装配误差微调。
     world_to_map_yaw_offset: 0.0
+    robot_frame_yaw_offset: 0.0
 
     transform_tolerance: 0.5       # TF查询超时 (s)
+
+    # ====== Jazzy(autoaim宿主机) -> Humble(nav容器) 直连补丁 ======
+    # 跨ROS2发行版的 DDS 发现虽然可见, 但业务消息不一定稳定可达。
+    # 这里额外开一条本地 UDP 通道, 将 auto_aim_target_pos 原样送入 pursuit_decision。
+    udp_enabled: true
+    udp_bind_ip: "0.0.0.0"
+    udp_port: 16666
 
     # ====== PnP噪声控制 ======
     # 旋转目标PnP解算可能有20-30cm误差, 需要滤波

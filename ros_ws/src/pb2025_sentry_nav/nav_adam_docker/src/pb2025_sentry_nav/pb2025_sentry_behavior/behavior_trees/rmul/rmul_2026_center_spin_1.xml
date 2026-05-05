@@ -1,0 +1,365 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║              rmul_2026_center_spin 行为树  ·  使用手册 + 调试指南               ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【行为逻辑】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. 死循环等待 game_progress == 4（比赛进行中），每秒检测一次
+  2. 导航前往白色区域中心点 (3.35, -5.15)，等到达才继续
+  3. 开启小陀螺 spin_speed=5.0 rad/s
+  4. 主循环（ReactiveFallback 每 tick 重新从上到下评估）：
+     - 优先级1: HP == 0  → 停转 + 等复活，复活后重开小陀螺
+     - 优先级2: HP < 200 → 撤退回中心点 (3.35, -5.15)
+     - 优先级3: 其他    → AlwaysSuccess，停在原地保持小陀螺
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【下位机通信原理】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  数据流方向：
+
+    上位机 ROS 节点
+    ─────────────────────────────────────────────────────────
+    话题 /cmd_vel (geometry_msgs/Twist)
+        linear.x → 底盘前后速度（发送前乘 -0.4，单位 m/s）
+        linear.y → 底盘左右速度（发送前乘 -0.4）
+        angular.z→ 底盘旋转速度
+    话题 /cmd_spin (std_msgs/Float64)
+        data=5.0 → 开小陀螺 5.0 rad/s
+        data=0.0 → 停小陀螺
+                │
+                │  serialpy_node.py  (my_serial_py 包)
+                │  串口: /dev/ttyUSB0 或 /dev/ttyACM0，波特率 115200
+                │
+                ▼
+    串口数据帧（发送给 STM32）：
+        格式: header(0xAA,1B) + x(float,4B) + y(float,4B)
+              + rotate(float,4B) + yaw(float,4B)
+              + running_state(uint8,1B) + CRC16_modbus(2B)
+        共 20 字节, 小端序 struct.pack('<BffffBH', ...)
+    ─────────────────────────────────────────────────────────
+    STM32 → 上位机（裁判系统数据）：
+        帧头 0xA5 + 结构体(22B) + CRC16_ccitt(2B) = 25 字节
+        结构: remain_hp(u16) + max_hp(u16) + game_type(u8)
+              + game_progress(u8) + stage_remain_time(u16)
+              + bullet_17mm(u16) + 红蓝基地血量(u16*4)
+              + rfid_status(u32)
+        解析后发布到 ROS 话题：
+            referee/robot_status  → current_hp (IsStatusOK 节点读取)
+            referee/game_status   → game_progress (IsGameStatus 节点读取)
+            referee/rfid_status   → RFID 区域信息
+
+  ★ 小陀螺通信关键路径：
+    PublishSpinSpeed(spin_speed=5.0)
+    → 发布 std_msgs/Float64 到 /cmd_spin
+    → fake_vel_transform 节点处理云台自旋补偿
+    → serialpy_node 将 spin 值合并到 running_state 字段
+    → STM32 收到后控制云台以 5.0 rad/s 旋转
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【参数调整】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  目标坐标（白色区域中心）：
+    本文件 SendNav2Goal x="11.28" y="-9.82"，地图为 qian1
+    修改方法：直接改 SendNav2Goal 的 x/y 属性值
+
+  小陀螺速度：
+    本文件 PublishSpinSpeed spin_speed="5.0"（单位 rad/s）
+    推荐范围 3.0~10.0；速度越高越难被锁定，但底盘控制更难
+
+  撤退血量阈值：
+    IsStatusOK hp_min="200"，血量低于 200 触发撤退
+    修改方法：改所有 hp_min="200" 为你想要的值
+
+  导航最大速度：
+    文件：pb2025_nav_bringup/config/reality/nav2_params.yaml
+    参数：max_velocity: [x_m/s, y_m/s, rot_rad/s]  当前 [3.0, 3.0, 1.0]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【速度监控命令（另开终端执行）】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # 监控底盘速度指令（Nav2 输出给下位机的）
+  ros2 topic echo /red_standard_robot1/cmd_vel
+
+  # 监控小陀螺速度指令
+  ros2 topic echo /red_standard_robot1/cmd_spin
+
+  # 监控当前血量和子弹
+  ros2 topic echo /red_standard_robot1/referee/robot_status
+
+  # 监控比赛状态（game_progress=4 是比赛中）
+  ros2 topic echo /red_standard_robot1/referee/game_status
+
+  # 监控机器人实际位置（世界坐标）
+  ros2 topic echo /red_standard_robot1/odometry
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【调试步骤（按顺序排查）】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ① 导航根本没启动（进程直接崩）
+     可能原因:
+       a. RViz X11 崩溃级联关闭 → 加 use_rviz:=False
+       b. map_server 加载失败   → 检查 three.yaml 内容和 three.pgm 是否同目录
+       c. pcd 文件缺失          → 检查 pcd/reality/three.pcd 是否存在
+     检查命令:
+       ls ~/ros_ws/install/pb2025_nav_bringup/share/pb2025_nav_bringup/map/reality/three.*
+       ls ~/ros_ws/install/pb2025_nav_bringup/share/pb2025_nav_bringup/pcd/reality/three.pcd
+       cat ~/ros_ws/install/pb2025_nav_bringup/share/pb2025_nav_bringup/map/reality/three.yaml
+
+  ② 启动了但 odom/tf 不存在
+     错误信息: "Invalid frame ID odom ... frame does not exist"
+     原因: LiDAR 没连上 → point_lio 没有数据 → odom 帧没有发布
+     检查命令:
+       ping -c 3 192.168.1.152                          # 检查雷达 IP
+       ip addr show enp8s0                               # 检查网卡 IP 是否是 192.168.1.50
+       ros2 topic hz /livox/lidar                        # 检查雷达数据是否到来
+     修复:
+       ip link set enp8s0 up
+       ip addr add 192.168.1.50/24 dev enp8s0
+     雷达 IP 配置文件:
+       ~/ros_ws/install/pb2025_nav_bringup/share/pb2025_nav_bringup/config/reality/mid360_user_config.json
+
+  ③ 导航启动但机器人不走
+     检查命令:
+       ros2 node list | grep behavior          # 行为树节点是否在运行
+       ros2 topic echo /red_standard_robot1/referee/game_status  # game_progress 是否==4
+     原因可能:
+       - 没有接裁判系统串口 → game_progress 永远不是 4
+       - serialpy_node 未启动 → 裁判数据不来
+     临时测试（绕过比赛状态检查，直接测试导航）:
+       ros2 topic pub /red_standard_robot1/referee/game_status \
+         pb_rm_interfaces/msg/GameStatus \
+         "{game_progress: 4, stage_remain_time: 420}" --rate 1
+
+  ④ 机器人走但走错了位置
+     原因: small_gicp 重定位失败，init_pose 设的初始位置与实际不符
+     检查命令:
+       ros2 topic echo /red_standard_robot1/odometry    # 看当前估计位置
+     修复:
+       修改 nav2_params.yaml 中:
+         init_pose: [x, y, 0.0, 0.0, 0.0, yaw]  # 改为机器人实际放置坐标
+
+  ⑤ 小陀螺没转
+     检查命令:
+       ros2 topic echo /red_standard_robot1/cmd_spin    # 有没有数据发出
+       ls /dev/ttyUSB*  或  ls /dev/ttyACM*             # 串口是否识别
+       ros2 node list | grep serial                     # serialpy 节点是否在跑
+     修复:
+       ros2 run my_serial_py serialpy_node               # 单独启动串口节点测试
+
+  ⑥ 查看完整日志
+       ls ~/.ros/log/latest/
+       cat ~/.ros/log/latest/*.log | grep -E "ERROR|WARN|FATAL"
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【里程计漂移 & 定位偏差处理】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  本系统定位架构：
+    point_lio（激光惯性里程计）→ 发布 odom → lidar_odom 变换（存在累积漂移）
+    small_gicp（点云配准重定位）→ 发布 map → odom 变换（持续修正漂移）
+    两者联合 → map → odom → base_footprint 完整 TF 链
+
+  ① 里程计漂移判断
+     检测漂移大小：
+       # 实时查看 map→odom 变换的偏移量（small_gicp 输出）
+       ros2 topic echo /tf | grep -A10 "map"
+       # 或查看重定位置信度
+       ros2 topic echo /red_standard_robot1/relocalization_score 2>/dev/null
+
+     正常范围：map→odom 的 x/y 偏移在 ±0.3m 以内算正常漂移修正
+     异常判断：偏移超过 1m 或频繁跳变，说明重定位失败
+
+  ② small_gicp 重定位参数调整（漂移大时调这里）
+     文件：pb2025_nav_bringup/config/reality/nav2_params.yaml
+     参数：
+       max_dist_sq: 16.0   # 匹配距离阈值（距离平方，单位m²）
+                           # 漂移大时调大此值（如 25.0 或 36.0），让重定位容忍更大偏差
+                           # 但太大会误匹配，建议不超过 64.0
+
+       global_leaf_size: 2.0      # PCD 下采样体素大小
+       registered_leaf_size: 2.0  # 减小此值（如 1.0）提高精度，但 CPU 消耗更大
+
+       num_threads: 4             # 增大可提高重定位频率
+
+  ③ 偏差很大时的手动重定位（运行时）
+     方法1：用 RViz 的 "2D Pose Estimate" 按钮在地图上点击真实位置
+             （需要 use_rviz:=True 且 X11 正常）
+
+     方法2：命令行发布初始位姿（替换 x/y/yaw 为机器人实际坐标）
+       ros2 topic pub --once /red_standard_robot1/initialpose \
+         geometry_msgs/msg/PoseWithCovarianceStamped \
+         "{header: {frame_id: 'map'},
+           pose: {pose: {position: {x: 11.28, y: -9.82, z: 0.0},
+                         orientation: {z: 0.0, w: 1.0}},
+                  covariance: [0.25,0,0,0,0,0, 0,0.25,0,0,0,0,
+                               0,0,0,0,0,0, 0,0,0,0,0,0,
+                               0,0,0,0,0,0, 0,0,0,0,0,0.068]}}"
+
+     方法3：修改 nav2_params.yaml 中 init_pose 为实际放置坐标，重启导航
+
+  ④ 开环检测说明（是否支持）
+     本系统使用 small_gicp 做闭环（点云配准），属于 有先验地图的重定位，
+     不是 SLAM 建图时的回环检测（loop closure）。
+
+     工作方式：
+       - 每帧实时将当前点云与 three.pcd/qian1.pcd 先验地图做 ICP 配准
+       - 配准结果直接修正 map→odom 变换，相当于持续的全局定位
+       - 只要环境与先验地图相似，定位不会累积漂移（不是开环）
+
+     失效场景（此时会漂）：
+       - 场地动态变化大（障碍物移动、人群遮挡）
+       - 机器人快速旋转导致点云稀疏
+       - LiDAR 被遮挡或数据量不足
+       - prior_pcd 与实际场地偏差大
+
+     应对：
+       - 保证 three.pcd / qian1.pcd 是在实际场地扫描的（slam:=True 建图时自动保存）
+       - 漂移超过 0.5m 用方法2 手动重定位
+       - 调大 max_dist_sq 容忍更大初始偏差
+
+  ⑤ 检测当前定位质量的快速命令
+     # 查看 TF tree 是否完整
+     ros2 run rqt_tf_tree rqt_tf_tree --ros-args -r /tf:=tf -r /tf_static:=tf_static
+
+     # 打印当前机器人在地图中的位置
+     ros2 run tf2_ros tf2_echo map base_footprint
+
+     # 查看 small_gicp 输出频率（正常应有稳定 Hz）
+     ros2 topic hz /tf | head -5
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+【启动命令汇总】
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  # 导航（实车）
+  source ~/ros_ws/install/setup.bash
+  ros2 launch pb2025_nav_bringup rm_navigation_reality_launch.py \
+    world:=three slam:=False use_robot_state_pub:=True use_rviz:=False
+
+  # 行为树（另一个终端）
+  source ~/ros_ws/install/setup.bash
+  ros2 launch pb2025_sentry_behavior sentry_behavior.launch.py
+
+  # 串口通信（另一个终端，如果没有被导航 launch 自动启动）
+  source ~/ros_ws/install/setup.bash
+  ros2 run my_serial_py serialpy_node
+-->
+<root BTCPP_format="4">
+
+  <!-- 死亡等复活 -->
+  <BehaviorTree ID="wait_for_respawn">
+    <Sequence>
+      <PublishSpinSpeed spin_speed="0.0" duration="0" topic_name="cmd_spin"/>
+      <PublishTwist v_x="0.0" v_y="0.0" v_yaw="0.0" duration="0" topic_name="cmd_vel"/>
+      <RetryUntilSuccessful num_attempts="-1">
+        <Sequence>
+          <Sleep msec="1000"/>
+          <IsStatusOK ammo_min="0" heat_max="999999" hp_min="1" key_port="{@referee_robotStatus}"/>
+        </Sequence>
+      </RetryUntilSuccessful>
+      <!-- 复活后重新开小陀螺 -->
+      <PublishSpinSpeed spin_speed="5.0" duration="0" topic_name="cmd_spin"/>
+    </Sequence>
+  </BehaviorTree>
+
+  <!-- 撤退到中心点 -->
+  <BehaviorTree ID="retreat_to_center">
+    <Sequence>
+      <SendNav2Goal x="0.47" y="0.00" yaw="1.57" action_name="navigate_to_pose"/>
+    </Sequence>
+  </BehaviorTree>
+
+  <!-- 主行为树 -->
+  <BehaviorTree ID="rmul_2026_center_spin">
+    <RetryUntilSuccessful num_attempts="-1">
+      <Sequence>
+        <!-- 等待比赛开始 -->
+        <RetryUntilSuccessful num_attempts="-1">
+          <Sequence>
+            <Sleep msec="1000"/>
+            <IsGameStatus name="IsGameStart"
+                          max_remain_time="420"
+                          min_remain_time="0"
+                          expected_game_progress="4"
+                          key_port="{@referee_gameStatus}"/>
+          </Sequence>
+        </RetryUntilSuccessful>
+
+        <!-- 比赛开始, 先前往中心点 -->
+        <SendNav2Goal x="0.47" y="0.00" yaw="1.57" action_name="navigate_to_pose"/>
+
+        <!-- 到达中心点，开启小陀螺 -->
+        <PublishSpinSpeed spin_speed="5.0" duration="0" topic_name="cmd_spin"/>
+
+        <!-- 主循环 -->
+        <KeepRunningUntilFailure>
+          <ReactiveFallback>
+
+            <!-- 优先级1: HP == 0 → 停车等复活 -->
+            <ReactiveSequence>
+              <Inverter>
+                <IsStatusOK ammo_min="0" heat_max="999999" hp_min="1" key_port="{@referee_robotStatus}"/>
+              </Inverter>
+              <SubTree ID="wait_for_respawn"/>
+            </ReactiveSequence>
+
+            <!-- 优先级2: HP < 200 → 撤退到中心点 -->
+            <ReactiveSequence>
+              <Inverter>
+                <IsStatusOK ammo_min="0" heat_max="999999" hp_min="200" key_port="{@referee_robotStatus}"/>
+              </Inverter>
+              <SubTree ID="retreat_to_center"/>
+            </ReactiveSequence>
+
+            <!-- 优先级3: HP >= 200 → 在中心点持续停留并保持小陀螺 -->
+            <AlwaysSuccess/>
+
+          </ReactiveFallback>
+        </KeepRunningUntilFailure>
+
+      </Sequence>
+    </RetryUntilSuccessful>
+  </BehaviorTree>
+
+  <TreeNodesModel>
+    <Condition ID="IsGameStatus">
+      <input_port name="max_remain_time" default="420" type="int"/>
+      <input_port name="min_remain_time" default="0" type="int"/>
+      <input_port name="expected_game_progress" default="4" type="int"/>
+      <input_port name="key_port" default="{@referee_gameStatus}" type="pb_rm_interfaces::msg::GameStatus_&lt;std::allocator&lt;void&gt; &gt;"/>
+    </Condition>
+    <Condition ID="IsStatusOK">
+      <input_port name="ammo_min" default="0" type="int"/>
+      <input_port name="heat_max" default="999999" type="int"/>
+      <input_port name="hp_min" default="200" type="int"/>
+      <input_port name="key_port" default="{@referee_robotStatus}" type="pb_rm_interfaces::msg::RobotStatus_&lt;std::allocator&lt;void&gt; &gt;"/>
+    </Condition>
+    <Action ID="PubNav2Goal">
+      <input_port name="x" default="0.0" type="double"/>
+      <input_port name="y" default="0.0" type="double"/>
+      <input_port name="yaw" default="0.0" type="double"/>
+      <input_port name="topic_name" default="goal_pose" type="std::string"/>
+    </Action>
+    <Action ID="SendNav2Goal">
+      <input_port name="x" default="0.0" type="double"/>
+      <input_port name="y" default="0.0" type="double"/>
+      <input_port name="yaw" default="0.0" type="double"/>
+      <input_port name="action_name" default="navigate_to_pose" type="std::string"/>
+    </Action>
+    <Action ID="PublishSpinSpeed">
+      <input_port name="spin_speed" default="5.0" type="double"/>
+      <input_port name="duration" type="int"/>
+      <input_port name="topic_name" default="cmd_spin" type="std::string"/>
+    </Action>
+    <Action ID="PublishTwist">
+      <input_port name="v_x" default="0.0" type="double"/>
+      <input_port name="v_y" default="0.0" type="double"/>
+      <input_port name="v_yaw" default="0.0" type="double"/>
+      <input_port name="duration" type="int"/>
+      <input_port name="topic_name" default="cmd_vel" type="std::string"/>
+    </Action>
+  </TreeNodesModel>
+
+</root>

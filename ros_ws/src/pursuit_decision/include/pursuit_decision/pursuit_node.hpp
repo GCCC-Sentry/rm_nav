@@ -62,15 +62,23 @@ private:
     double hp_retreat_threshold{150.0};      // 血量撤退阈值
 
     // 坐标系
-    std::string map_frame_id{"map"};
-    std::string robot_frame_id{"chassis"};
+    std::string map_frame_id{"odom"};
+    std::string robot_frame_id{"gimbal_yaw"};
+    std::string fallback_map_frame_id{"map"};
+    std::string fallback_robot_frame_id{"base_footprint"};
     double transform_tolerance{0.5};         // TF超时 (s)
+
+    // UDP 直连接口
+    bool udp_enabled{true};
+    std::string udp_bind_ip{"0.0.0.0"};
+    int udp_port{16666};
 
     // IMU世界坐标系 → 导航map坐标系 的yaw偏移量 (rad)
     // 自瞄使用IMU世界坐标系, 导航使用map坐标系
     // 两者共享重力方向, 仅差一个绕Z轴的yaw偏移
     // 标定方法: 机器人初始位置确定时, offset = map_yaw - imu_world_yaw
     double world_to_map_yaw_offset{0.0};
+    double robot_frame_yaw_offset{0.0};
 
     // 噪声滤波
     double pnp_noise_threshold{0.5};         // PnP噪声阈值 (m)
@@ -113,6 +121,7 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr target_pose_pub_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr attack_pose_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr nav_goal_pose_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr pursuit_status_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_markers_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr goal_history_pub_;
@@ -143,12 +152,17 @@ private:
   bool has_last_goal_{false};
   geometry_msgs::msg::PoseStamped last_goal_;
   std::vector<geometry_msgs::msg::Point> last_candidate_points_;
+  std::string active_global_frame_id_{"odom"};
+  int udp_socket_fd_{-1};
 
   // ===================== 回调 =====================
   void on_aim_target(const std_msgs::msg::String::SharedPtr msg);
   void on_robot_status(const std_msgs::msg::String::SharedPtr msg);
   void on_game_status(const std_msgs::msg::String::SharedPtr msg);
   void on_costmap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
+  void process_aim_target_payload(const std::string & payload, const char * source_tag);
+  void poll_udp_targets();
+  bool setup_udp_socket();
 
   // ===================== 决策逻辑 =====================
   void decision_callback();
@@ -166,11 +180,11 @@ private:
   /// 获取机器人当前在map frame的位置
   bool get_robot_position(double & x, double & y, double & z);
 
-  /// 将IMU世界坐标系下的相对向量转换到map frame下的绝对位置
-  /// auto_aim发布的是目标相对于云台在IMU世界坐标系的向量
-  /// 转换: target_map = robot_map + R(yaw_offset) * xyz_in_world
-  bool world_vector_to_map(
-    double world_x, double world_y, double world_z,
+  /// 将云台/小yaw局部坐标系下的相对向量转换到导航全局系下的绝对位置
+  /// auto_aim发布的是 xyz_in_gimbal，x前/y左/z上
+  /// 转换: target_global = robot_global + R(robot_yaw + static_offsets) * xyz_in_gimbal
+  bool gimbal_vector_to_map(
+    double gimbal_x, double gimbal_y, double gimbal_z,
     double & mx, double & my, double & mz);
 
   /// 计算追击目标点 (类似CalculateAttackPose的圆形候选)

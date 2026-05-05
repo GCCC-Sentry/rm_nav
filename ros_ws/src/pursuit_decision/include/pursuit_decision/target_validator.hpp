@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <deque>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -34,6 +35,9 @@ public:
   /// 检查目标是否已确认 (满足多帧一致性)
   bool is_confirmed() const;
 
+  /// 返回当前未确认/确认的具体原因，便于日志排查
+  std::string explain_confirmation_status() const;
+
   /// 获取当前确认的目标ID (-1 = 无)
   int get_confirmed_target_id() const;
 
@@ -42,6 +46,9 @@ public:
 
   /// 获取自上次有效观测以来的时间（秒）
   double time_since_last_observation() const;
+
+  /// 最近一次 add_observation 的处理结果
+  const std::string & last_observation_status() const {return last_observation_status_;}
 
   /// 重置状态
   void reset();
@@ -54,6 +61,7 @@ private:
 
   std::deque<TargetObservation> buffer_;
   int confirmed_target_id_{-1};
+  std::string last_observation_status_{"尚无观测"};
 
   /// 清理过期数据
   void cleanup_expired();

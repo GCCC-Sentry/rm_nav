@@ -43,6 +43,23 @@ if [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" != "true" ]; then
     fi
 fi
 
+WORKSPACE_PROBE="/root/ros_ws/install/pb2025_nav_bringup/share/pb2025_nav_bringup/local_setup.bash"
+
+if ! docker exec "$CONTAINER" bash -lc "
+    if [ ! -L '$WORKSPACE_PROBE' ]; then
+        exit 1
+    fi
+    target=\$(readlink '$WORKSPACE_PROBE')
+    case \"\$target\" in
+        /root/ros_ws/*) exit 0 ;;
+        *) exit 1 ;;
+    esac
+"; then
+    echo "检测到容器内 ROS 工作区 install 链接无效，正在容器内重建..."
+    docker exec -e ROS_DISTRO=humble -it "$CONTAINER" bash -lc \
+        "cd /root/ros_ws && source /opt/ros/humble/setup.bash && colcon build --symlink-install"
+fi
+
 echo "正在启动 ROS2 导航系统..."
 echo "将打开 5 个独立终端窗口"
 

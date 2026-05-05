@@ -309,7 +309,7 @@ Visualization Manager:
           Offset:
             X: 0
             Y: 0
-            Z: 0.05
+            Z: 0.05000000074505806
           Pose Color: 255; 85; 255
           Pose Style: None
           Radius: 0.029999999329447746
@@ -375,7 +375,7 @@ Visualization Manager:
           Offset:
             X: 0
             Y: 0
-            Z: 0.1
+            Z: 0.10000000149011612
           Pose Color: 255; 85; 255
           Pose Style: None
           Radius: 0.029999999329447746
@@ -421,7 +421,8 @@ Visualization Manager:
           Enabled: true
           Name: MPPI Trajectories
           Namespaces:
-            {}
+            Candidate Trajectories: true
+            Optimal Trajectory: true
           Topic:
             Depth: 5
             Durability Policy: Volatile
@@ -447,13 +448,13 @@ Visualization Manager:
       Enabled: true
       Name: MarkerArray
       Namespaces:
-        {}
+        pursuit_debug: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /region_markers
+        Value: /pursuit_debug_markers
       Value: true
     - Alpha: 1
       Buffer Length: 1
