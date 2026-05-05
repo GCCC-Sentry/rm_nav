@@ -61,7 +61,7 @@ if ! docker exec "$CONTAINER" bash -lc "
 fi
 
 echo "正在启动 ROS2 导航系统..."
-echo "将打开 5 个独立终端窗口"
+echo "将打开 6 个独立终端窗口"
 
 gnome-terminal --title="rm_static_tf" -- bash -c "docker exec -e ROS_DISTRO=humble -it $CONTAINER bash -lc 'cd /root/ros_ws && $ROS_ENV_CMD && ros2 launch rm_static_tf static_tf.launch.py'; exec bash" &
 sleep 0.5
@@ -74,6 +74,9 @@ sleep 3
 
 gnome-terminal --title="my_serial_py" -- bash -c "docker exec -e ROS_DISTRO=humble -it $CONTAINER bash -lc 'cd /root/ros_ws && $ROS_ENV_CMD && ros2 launch my_serial_py serial.launch.py'; exec bash" &
 sleep 3
+
+gnome-terminal --title="pb2025_region_monitor" -- bash -c "docker exec -e ROS_DISTRO=humble -it $CONTAINER bash -lc 'cd /root/ros_ws && $ROS_ENV_CMD && ros2 run pb2025_region_monitor region_monitor_node'; exec bash" &
+sleep 1
 
 gnome-terminal --title="pb2025_alliance_decision" -- bash -c "docker exec -e ROS_DISTRO=humble -it $CONTAINER bash -lc 'cd /root/ros_ws && $ROS_ENV_CMD && ros2 launch pb2025_alliance_decision alliance_decision.launch.py'; exec bash" &
 

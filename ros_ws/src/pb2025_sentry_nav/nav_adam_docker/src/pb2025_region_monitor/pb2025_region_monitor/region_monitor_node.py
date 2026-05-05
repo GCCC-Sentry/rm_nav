@@ -1,5 +1,7 @@
 import rclpy
 import math
+import socket
+import threading
 import time
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
@@ -10,6 +12,13 @@ from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
 from auto_aim_interfaces.msg import Target
+
+try:
+    from sentry_interfaces.msg import EnemyTargetArray
+    HAS_SENTRY_INTERFACES = True
+except ImportError:
+    EnemyTargetArray = None
+    HAS_SENTRY_INTERFACES = False
 
 
 # ================= 颠簸区域配置 =================
@@ -30,6 +39,7 @@ BUMP_ZONES = [
         'target_yaw': 0.0,       # yaw=0 即 map +X 方向
         'forward_speed': 1.0,    # 前进速度 m/s
     },
+
     # 可继续添加更多颠簸区域:
     # {
     #     'name': 'bump_zone_2',
@@ -48,6 +58,8 @@ BUMP_RUNNING_STATE = 5  # 颠簸区域底盘对齐模式 (非姿态切换)
 BUMP_ALIGN_TOLERANCE_DEG = 3.0
 BUMP_HOLD_SECONDS = 10.0
 BUMP_DRIVE_SPEED = -1.5
+OMNI_YAW_UDP_PORT = 25100
+OMNI_YAW_SCALE = 0.6
 # ================================================
 
 
@@ -73,6 +85,30 @@ def quaternion_to_yaw(q):
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny_cosp, cosy_cosp)
+
+
+def describe_turn_direction(angle_deg):
+    if angle_deg > 1.0:
+        return '向左转'
+    if angle_deg < -1.0:
+        return '向右转'
+    return '基本居中'
+
+
+def describe_target_sector(angle_deg):
+    if -10.0 <= angle_deg <= 10.0:
+        return '正前方'
+    if 10.0 < angle_deg <= 45.0:
+        return '左前方'
+    if 45.0 < angle_deg <= 135.0:
+        return '左侧'
+    if angle_deg > 135.0:
+        return '左后侧'
+    if -45.0 <= angle_deg < -10.0:
+        return '右前方'
+    if -135.0 <= angle_deg < -45.0:
+        return '右侧'
+    return '右后侧'
 
 
 class RegionMonitorNode(Node):
@@ -101,6 +137,12 @@ class RegionMonitorNode(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.yaw_angle_pub = self.create_publisher(Float32, '/cmd_yaw_angle', 10)
         self.chassis_mode_pub = self.create_publisher(Int8, '/cmd_chassis_mode', 10)
+        self.omni_yaw_sub = self.create_subscription(
+            Float32, '/omni_yaw_angle', self.omni_yaw_callback, 10)
+        self.omni_targets_sub = None
+        if HAS_SENTRY_INTERFACES:
+            self.omni_targets_sub = self.create_subscription(
+                EnemyTargetArray, '/enemy_targets', self.omni_targets_callback, 10)
         self.enemy_targets_sub = self.create_subscription(
             Target, '/tracker/target', self.enemy_targets_callback, 10)
         self.goal_pose_sub = self.create_subscription(
@@ -117,12 +159,23 @@ class RegionMonitorNode(Node):
         self.start_yaw = None              # 节点启动后首次有效 TF 的起始角度(连续角)
         self.current_yaw = 0.0
         self.current_yaw_unwrapped = None
+        self.latest_omni_yaw_udp = None
+        self.latest_omni_yaw_std = None
+        self.latest_omni_yaw = None
         self.latest_enemy_yaw = None
         self.latest_nav_yaw = None
         self.pose_valid = False
         self.last_yaw_log_time = 0.0
+        self.last_mode_log_time = 0.0
         self.bump_phase = 'idle'
         self.bump_hold_start_time = None
+        self.udp_running = True
+        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.udp_socket.bind(('127.0.0.1', OMNI_YAW_UDP_PORT))
+        self.udp_socket.settimeout(0.5)
+        self.udp_thread = threading.Thread(target=self._omni_udp_loop, daemon=True)
+        self.udp_thread.start()
 
         # 定时器: 10Hz 检查区域 + 发布可视化
         self.timer = self.create_timer(0.1, self.timer_callback)
@@ -133,6 +186,30 @@ class RegionMonitorNode(Node):
         self.get_logger().info(
             f'区域监控节点已启动: {len(self.regions)} 个普通区域, '
             f'{len(BUMP_ZONES)} 个颠簸区域')
+        if HAS_SENTRY_INTERFACES:
+            self.get_logger().info('已启用全向感知订阅: /omni_yaw_angle + /enemy_targets')
+        else:
+            self.get_logger().warn(
+                '未检测到 sentry_interfaces，当前仍可使用标准话题 /omni_yaw_angle；'
+                '若需直接读取 /enemy_targets，请先编译 sentry_interfaces 后重新 source 工作区。')
+        self.get_logger().info(f'已启用全向角 UDP 监听: 127.0.0.1:{OMNI_YAW_UDP_PORT}')
+
+    def _omni_udp_loop(self):
+        while self.udp_running:
+            try:
+                payload, _ = self.udp_socket.recvfrom(256)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            try:
+                self.latest_omni_yaw_udp = float(payload.decode('utf-8').strip())
+            except ValueError:
+                continue
+
+    def omni_yaw_callback(self, msg):
+        self.latest_omni_yaw_std = float(msg.data)
 
     @staticmethod
     def point_in_polygon(px, py, vertices):
@@ -311,19 +388,52 @@ class RegionMonitorNode(Node):
             return
         self.latest_enemy_yaw = float(msg.yaw)
 
+    def omni_targets_callback(self, msg):
+        if not msg.targets:
+            return
+
+        best_target = min(
+            msg.targets,
+            key=lambda target: (
+                0 if target.is_tracking else 1,
+                int(target.priority),
+                -float(target.confidence)))
+        self.latest_omni_yaw = float(best_target.yaw)
+        self.get_logger().info(
+            f'[全向感知] 目标数={len(msg.targets)}, 选中ID={int(best_target.id)}, '
+            f'跟踪中={bool(best_target.is_tracking)}, 优先级={int(best_target.priority)}, '
+            f'置信度={float(best_target.confidence):.3f}, '
+            f'方位角={self.latest_omni_yaw:.3f}rad / {math.degrees(self.latest_omni_yaw):.1f}deg')
+
     def goal_pose_callback(self, msg):
         self.latest_nav_yaw = quaternion_to_yaw(msg.pose.orientation)
 
     def _publish_selected_yaw(self):
+        selected_yaw = None
+        yaw_source = 'current'
+        omni_sign_flipped = False
         if self.in_bump_zone:
             selected_yaw = self.latest_nav_yaw
             if selected_yaw is None and self.active_bump_zone is not None:
                 selected_yaw = float(self.active_bump_zone['target_yaw'])
             yaw_source = 'bump_nav'
         else:
-            selected_yaw = self.latest_enemy_yaw
-            yaw_source = 'enemy'
-            if selected_yaw is None:
+            if self.latest_omni_yaw_udp is not None:
+                selected_yaw = -self.latest_omni_yaw_udp * OMNI_YAW_SCALE
+                yaw_source = 'omni_udp'
+                omni_sign_flipped = True
+            elif self.latest_omni_yaw_std is not None:
+                selected_yaw = -self.latest_omni_yaw_std * OMNI_YAW_SCALE
+                yaw_source = 'omni_std'
+                omni_sign_flipped = True
+            elif self.latest_omni_yaw is not None:
+                selected_yaw = -self.latest_omni_yaw * OMNI_YAW_SCALE
+                yaw_source = 'omni'
+                omni_sign_flipped = True
+            elif self.latest_enemy_yaw is not None:
+                selected_yaw = self.latest_enemy_yaw
+                yaw_source = 'enemy_legacy'
+            elif self.latest_nav_yaw is not None:
                 selected_yaw = self.latest_nav_yaw
                 yaw_source = 'nav'
 
@@ -331,7 +441,8 @@ class RegionMonitorNode(Node):
             selected_yaw = self.current_yaw
             yaw_source = 'current'
 
-        selected_yaw = float(normalize_angle(selected_yaw))
+        if yaw_source not in ('omni_udp', 'omni_std'):
+            selected_yaw = float(normalize_angle(selected_yaw))
         current_yaw_relative = None
         sent_yaw_deg = None
         yaw_delta = None
@@ -341,10 +452,68 @@ class RegionMonitorNode(Node):
         if self.in_bump_zone:
             if yaw_delta is not None:
                 sent_yaw_deg = float(math.degrees(normalize_angle(yaw_delta)))
+        elif yaw_source == 'omni_udp':
+            sent_yaw_deg = float(selected_yaw)
+        elif yaw_source == 'omni_std':
+            sent_yaw_deg = float(selected_yaw)
+        elif yaw_source == 'omni':
+            sent_yaw_deg = float(math.degrees(selected_yaw))
         elif self.start_yaw is not None:
             sent_yaw_deg = float(math.degrees(normalize_angle(selected_yaw - self.start_yaw)))
         running_state = BUMP_RUNNING_STATE if self.in_bump_zone else 0
         now = time.time()
+        if now - self.last_mode_log_time >= 0.5:
+            self.last_mode_log_time = now
+            if self.in_bump_zone:
+                mode_name = '颠簸路段底盘对齐模式'
+            elif yaw_source == 'omni_udp':
+                mode_name = '全向感知跟踪模式'
+            elif yaw_source == 'omni_std':
+                mode_name = '全向感知跟踪模式'
+            elif yaw_source == 'omni':
+                mode_name = '全向感知跟踪模式'
+            elif yaw_source == 'enemy_legacy':
+                mode_name = '旧自瞄目标回退模式'
+            elif yaw_source == 'nav':
+                mode_name = '导航目标角回退模式'
+            else:
+                mode_name = '当前车头角回退模式'
+            omni_yaw_str = (
+                'None' if self.latest_omni_yaw is None
+                else f'{self.latest_omni_yaw:.3f} rad / {math.degrees(self.latest_omni_yaw):.1f} deg'
+            )
+            omni_yaw_udp_str = (
+                'None' if self.latest_omni_yaw_udp is None
+                else f'{self.latest_omni_yaw_udp:.1f} deg'
+            )
+            omni_sector_str = (
+                'None' if self.latest_omni_yaw_udp is None
+                else describe_target_sector(self.latest_omni_yaw_udp)
+            )
+            omni_yaw_std_str = (
+                'None' if self.latest_omni_yaw_std is None
+                else f'{self.latest_omni_yaw_std:.1f} deg'
+            )
+            if yaw_source == 'omni_udp':
+                yaw_source_str = '全向感知UDP角'
+            elif yaw_source == 'omni_std':
+                yaw_source_str = '全向感知标准角'
+            elif yaw_source == 'omni':
+                yaw_source_str = '全向感知'
+            elif yaw_source == 'enemy_legacy':
+                yaw_source_str = '旧自瞄目标'
+            elif yaw_source == 'nav':
+                yaw_source_str = '导航目标角'
+            elif yaw_source == 'bump_nav':
+                yaw_source_str = '颠簸区对齐'
+            else:
+                yaw_source_str = '当前车头角'
+            self.get_logger().info(
+                f'[模式] 当前模式={mode_name}, 颠簸阶段={self.bump_phase}, '
+                f'角度来源={yaw_source_str}, 全向感知UDP角={omni_yaw_udp_str}, '
+                f'目标方位={omni_sector_str}, 全向感知标准角={omni_yaw_std_str}, '
+                f'全向感知融合角={omni_yaw_str}, 左右修正={"已取反" if omni_sign_flipped else "未取反"}, '
+                f'角度缩放={OMNI_YAW_SCALE:.2f}')
         if now - self.last_yaw_log_time >= 0.5:
             self.last_yaw_log_time = now
             start_yaw_str = 'None' if self.start_yaw is None else '0.0'
@@ -354,14 +523,26 @@ class RegionMonitorNode(Node):
             )
             yaw_delta_str = 'None' if yaw_delta is None else f'{math.degrees(yaw_delta):.1f}'
             sent_yaw_str = 'None' if sent_yaw_deg is None else f'{sent_yaw_deg:.1f}'
+            turn_direction_str = (
+                'None' if sent_yaw_deg is None else describe_turn_direction(sent_yaw_deg)
+            )
             self.get_logger().info(
-                f'[CMD_YAW] running_state={running_state}, source={yaw_source}, '
-                f'start={start_yaw_str} deg, current={current_yaw_str} deg, '
-                f'delta={yaw_delta_str} deg, sent={sent_yaw_str} deg')
+                f'[控制角] 运行状态={running_state}, 角度来源={yaw_source_str}, '
+                f'启动基准角={start_yaw_str} deg, 当前相对角={current_yaw_str} deg, '
+                f'对齐差值={yaw_delta_str} deg, 下发角度={sent_yaw_str} deg, '
+                f'电控应动作={turn_direction_str}')
 
         yaw_msg = Float32()
         yaw_msg.data = 0.0 if sent_yaw_deg is None else sent_yaw_deg
         self.yaw_angle_pub.publish(yaw_msg)
+
+    def destroy_node(self):
+        self.udp_running = False
+        try:
+            self.udp_socket.close()
+        except OSError:
+            pass
+        super().destroy_node()
 
     # ================= 可视化辅助 =================
 

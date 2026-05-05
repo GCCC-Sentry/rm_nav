@@ -1,0 +1,12 @@
+std_msgs/Header header
+uint8 id
+uint8 target_color
+uint8 target_number
+uint8 priority
+uint32 first_seen_seq
+float32 x
+float32 y
+float32 z
+float32 yaw
+float32 confidence
+bool is_tracking
