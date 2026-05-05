@@ -1,0 +1,661 @@
+import rclpy
+import math
+import socket
+import threading
+import time
+from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
+from geometry_msgs.msg import Point, PoseStamped, Twist
+from std_msgs.msg import Float32, Int8
+from visualization_msgs.msg import Marker, MarkerArray
+from tf2_ros import TransformException
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
+from auto_aim_interfaces.msg import Target
+
+try:
+    from sentry_interfaces.msg import EnemyTargetArray
+    HAS_SENTRY_INTERFACES = True
+except ImportError:
+    EnemyTargetArray = None
+    HAS_SENTRY_INTERFACES = False
+
+
+# ================= 颠簸区域配置 =================
+# 每个区域包含:
+#   name      : 区域名称 (日志/可视化)
+#   vertices  : 多边形顶点 [(x,y), ...], map坐标系, 按顺序排列
+#   target_yaw: 穿越时 yaw 目标角度 (弧度, map坐标系, 0 = +X方向)
+#   forward_speed: 期望前进速度标量 (m/s, 建议填正值表示“想前进多快”)
+#   cmd_vel_x_sign: 发布到 /cmd_vel 的 X 方向符号
+#                   +1 表示当前链路里 +x 就是物理前进
+#                   -1 表示当前链路里 -x 才是物理前进
+BUMP_ZONES = [
+    {
+        'name': 'bump_zone_1',
+        'vertices': [
+                (-4.77, -3.68),
+                (-4.84, 2.94),
+                (3.07, 2.99),
+                (3.38, -3.96),
+        ],
+        'target_yaw': 0.0,       # yaw=0 即 map +X 方向
+        'forward_speed': 1.0,    # 期望前进速度标量 m/s
+        'cmd_vel_x_sign': -1.0,  # 当前底盘链路里，物理前进需要发负的 linear.x
+    },
+
+    # 可继续添加更多颠簸区域:
+    # {
+    #     'name': 'bump_zone_2',
+    #     'vertices': [(5.0, 2.0), (7.0, 2.0), (7.0, 4.0), (5.0, 4.0)],
+    #     'target_yaw': 1.57,   # +Y方向穿越
+    #     'forward_speed': 1.0,
+    # },
+]
+
+# 颠簸区域覆盖发送频率 (Hz)
+BUMP_OVERRIDE_RATE = 50.0
+
+# 进入颠簸区域时发给 /cmd_chassis_mode 的 running_state 值
+# 注意: running_state=5 专用于颠簸区域底盘 yaw 对齐, 与姿态切换 (1/2/3) 是两套独立逻辑
+BUMP_RUNNING_STATE = 5  # 颠簸区域底盘对齐模式 (非姿态切换)
+BUMP_ALIGN_TOLERANCE_DEG = 3.0
+BUMP_HOLD_SECONDS = 10.0
+BUMP_DEFAULT_DRIVE_SPEED = 1.0
+BUMP_DRIVE_LATCH_SECONDS = 5.0
+BUMP_EXIT_DEBOUNCE_SECONDS = 1.0
+OMNI_YAW_UDP_PORT = 25100
+OMNI_YAW_SCALE = 0.6
+# ================================================
+
+
+def normalize_angle(angle):
+    """将角度归一化到 [-pi, pi]"""
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+    return angle
+
+
+def unwrap_angle(previous_unwrapped, current_wrapped):
+    """将当前 [-pi, pi] 角度展开到连续角度。"""
+    if previous_unwrapped is None:
+        return current_wrapped
+    delta = normalize_angle(current_wrapped - previous_unwrapped)
+    return previous_unwrapped + delta
+
+
+def quaternion_to_yaw(q):
+    """从四元数提取 yaw 角 (绕 Z 轴旋转)"""
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def describe_turn_direction(angle_deg):
+    if angle_deg > 1.0:
+        return '向左转'
+    if angle_deg < -1.0:
+        return '向右转'
+    return '基本居中'
+
+
+def describe_target_sector(angle_deg):
+    if -10.0 <= angle_deg <= 10.0:
+        return '正前方'
+    if 10.0 < angle_deg <= 45.0:
+        return '左前方'
+    if 45.0 < angle_deg <= 135.0:
+        return '左侧'
+    if angle_deg > 135.0:
+        return '左后侧'
+    if -45.0 <= angle_deg < -10.0:
+        return '右前方'
+    if -135.0 <= angle_deg < -45.0:
+        return '右侧'
+    return '右后侧'
+
+
+def angle_error_deg(target_yaw, current_yaw):
+    """返回目标 yaw 相对当前 yaw 的最短角误差，单位 deg。"""
+    return math.degrees(normalize_angle(target_yaw - current_yaw))
+
+
+class RegionMonitorNode(Node):
+    def __init__(self):
+        super().__init__('region_monitor_node')
+
+        # ================= 普通监控区域 (保留原有功能) =================
+        self.regions = [
+            {
+                'name': 'patrol_zone_1',
+                'vertices': [
+                    (-5.77, -3.68),
+                    (-5.84, -6.06),
+                    (1.07, -6.00),
+                    (1.38, -3.96),
+                ]
+            },
+            # 您可以添加更多普通监控区域...
+        ]
+        # ===================================================================
+
+        # 发布可视化 Marker 的话题
+        self.marker_pub = self.create_publisher(MarkerArray, '/region_markers', 10)
+
+        # ===== 颠簸区域穿越: 发布控制指令 =====
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.yaw_angle_pub = self.create_publisher(Float32, '/cmd_yaw_angle', 10)
+        self.chassis_mode_pub = self.create_publisher(Int8, '/cmd_chassis_mode', 10)
+        self.omni_yaw_sub = self.create_subscription(
+            Float32, '/omni_yaw_angle', self.omni_yaw_callback, 10)
+        self.omni_targets_sub = None
+        if HAS_SENTRY_INTERFACES:
+            self.omni_targets_sub = self.create_subscription(
+                EnemyTargetArray, '/enemy_targets', self.omni_targets_callback, 10)
+        self.enemy_targets_sub = self.create_subscription(
+            Target, '/tracker/target', self.enemy_targets_callback, 10)
+        self.goal_pose_sub = self.create_subscription(
+            PoseStamped, '/goal_pose', self.goal_pose_callback, 10)
+
+        # TF 监听器
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        # 状态记录
+        self.in_region_prev = False        # 普通区域
+        self.in_bump_zone = False          # 颠簸区域
+        self.active_bump_zone = None       # 当前激活的颠簸区域配置
+        self.start_yaw = None              # 节点启动后首次有效 TF 的起始角度(连续角)
+        self.current_yaw = 0.0
+        self.current_yaw_unwrapped = None
+        self.latest_omni_yaw_udp = None
+        self.latest_omni_yaw_std = None
+        self.latest_omni_yaw = None
+        self.latest_enemy_yaw = None
+        self.latest_nav_yaw = None
+        self.pose_valid = False
+        self.last_yaw_log_time = 0.0
+        self.last_mode_log_time = 0.0
+        self.bump_phase = 'idle'
+        self.bump_hold_start_time = None
+        self.bump_drive_start_time = None
+        self.bump_drive_twist = None
+        self.bump_exit_pending_since = None
+        self.udp_running = True
+        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.udp_socket.bind(('127.0.0.1', OMNI_YAW_UDP_PORT))
+        self.udp_socket.settimeout(0.5)
+        self.udp_thread = threading.Thread(target=self._omni_udp_loop, daemon=True)
+        self.udp_thread.start()
+
+        # 定时器: 10Hz 检查区域 + 发布可视化
+        self.timer = self.create_timer(0.1, self.timer_callback)
+
+        # 定时器: 高频颠簸区域覆盖 (默认不启动, 进入区域时动态创建)
+        self.bump_override_timer = None
+
+        self.get_logger().info(
+            f'区域监控节点已启动: {len(self.regions)} 个普通区域, '
+            f'{len(BUMP_ZONES)} 个颠簸区域')
+        if HAS_SENTRY_INTERFACES:
+            self.get_logger().info('已启用全向感知订阅: /omni_yaw_angle + /enemy_targets')
+        else:
+            self.get_logger().warn(
+                '未检测到 sentry_interfaces，当前仍可使用标准话题 /omni_yaw_angle；'
+                '若需直接读取 /enemy_targets，请先编译 sentry_interfaces 后重新 source 工作区。')
+        self.get_logger().info(f'已启用全向角 UDP 监听: 127.0.0.1:{OMNI_YAW_UDP_PORT}')
+
+    def _omni_udp_loop(self):
+        while self.udp_running:
+            try:
+                payload, _ = self.udp_socket.recvfrom(256)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            try:
+                self.latest_omni_yaw_udp = float(payload.decode('utf-8').strip())
+            except ValueError:
+                continue
+
+    def omni_yaw_callback(self, msg):
+        self.latest_omni_yaw_std = float(msg.data)
+
+    @staticmethod
+    def point_in_polygon(px, py, vertices):
+        """射线法判断点是否在多边形内"""
+        n = len(vertices)
+        inside = False
+        j = n - 1
+        for i in range(n):
+            xi, yi = vertices[i]
+            xj, yj = vertices[j]
+            if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+                inside = not inside
+            j = i
+        return inside
+
+    def timer_callback(self):
+        try:
+            # 1. 获取机器人坐标和朝向
+            t = self.tf_buffer.lookup_transform(
+                'map', 'base_footprint', rclpy.time.Time())
+
+            current_x = t.transform.translation.x
+            current_y = t.transform.translation.y
+            self.current_yaw = quaternion_to_yaw(t.transform.rotation)
+            self.current_yaw_unwrapped = unwrap_angle(
+                self.current_yaw_unwrapped, self.current_yaw)
+            if self.start_yaw is None:
+                self.start_yaw = self.current_yaw_unwrapped
+            self.pose_valid = True
+
+            # 2. 检查普通监控区域 + 发布可视化
+            in_any_region = False
+            marker_array = MarkerArray()
+            timestamp = self.get_clock().now().to_msg()
+
+            for i, region in enumerate(self.regions):
+                verts = region['vertices']
+                is_inside_this = self.point_in_polygon(current_x, current_y, verts)
+                if is_inside_this:
+                    in_any_region = True
+
+                # 构建可视化 Marker (普通区域: 绿/红)
+                marker = self._make_polygon_marker(
+                    i, "monitor_regions", verts, timestamp,
+                    inside=is_inside_this,
+                    color_in=(1.0, 0.0, 0.0),    # 红
+                    color_out=(0.0, 1.0, 0.0))    # 绿
+                marker_array.markers.append(marker)
+
+            # 3. 检查颠簸区域 + 发布可视化
+            detected_bump_zone = None
+
+            for i, zone in enumerate(BUMP_ZONES):
+                verts = zone['vertices']
+                is_inside_this = self.point_in_polygon(current_x, current_y, verts)
+                if is_inside_this:
+                    detected_bump_zone = zone
+
+                # 颠簸区域可视化 (蓝/橙)
+                marker = self._make_polygon_marker(
+                    100 + i, "bump_zones", verts, timestamp,
+                    inside=is_inside_this,
+                    color_in=(1.0, 0.5, 0.0),    # 橙 (激活)
+                    color_out=(0.0, 0.5, 1.0),    # 蓝 (未激活)
+                    line_width=0.08)
+                marker_array.markers.append(marker)
+
+            self.marker_pub.publish(marker_array)
+
+            # 4. 普通区域日志
+            if in_any_region and not self.in_region_prev:
+                self.get_logger().warn('>>> 进入监控区域')
+            elif not in_any_region and self.in_region_prev:
+                self.get_logger().info('<<< 离开监控区域')
+            self.in_region_prev = in_any_region
+
+            # 5. 颠簸区域进入/离开处理
+            self._update_bump_zone_state(detected_bump_zone)
+            self._publish_selected_yaw()
+
+        except TransformException:
+            pass
+
+    # ================= 颠簸区域进入/离开逻辑 =================
+
+    def _update_bump_zone_state(self, detected_bump_zone):
+        if detected_bump_zone is not None:
+            self.bump_exit_pending_since = None
+            self.active_bump_zone = detected_bump_zone
+            if not self.in_bump_zone:
+                self.in_bump_zone = True
+                self._on_enter_bump_zone()
+            return
+
+        if not self.in_bump_zone:
+            self.active_bump_zone = None
+            return
+
+        if self.bump_phase in ('aligning', 'driving'):
+            now = time.time()
+            if (
+                self.bump_phase == 'driving'
+                and self.bump_drive_start_time is not None
+                and now - self.bump_drive_start_time < BUMP_DRIVE_LATCH_SECONDS
+            ):
+                return
+            if self.bump_exit_pending_since is None:
+                self.bump_exit_pending_since = now
+                self.get_logger().warn(
+                    f'[BUMP] 当前未检测到颠簸区域，开始退出退抖 {BUMP_EXIT_DEBOUNCE_SECONDS:.1f}s')
+                return
+            if now - self.bump_exit_pending_since < BUMP_EXIT_DEBOUNCE_SECONDS:
+                return
+
+        self._on_leave_bump_zone()
+
+    def _on_enter_bump_zone(self):
+        """进入颠簸区域: 启动高频覆盖定时器"""
+        zone = self.active_bump_zone
+        forward_speed = float(zone.get('forward_speed', BUMP_DEFAULT_DRIVE_SPEED))
+        cmd_vel_x_sign = float(zone.get('cmd_vel_x_sign', 1.0))
+        cmd_vel_x = abs(forward_speed) * (1.0 if cmd_vel_x_sign >= 0.0 else -1.0)
+
+        self.get_logger().warn(
+            f'>>> 进入颠簸区域 [{zone["name"]}]! '
+            f'强制 running_state={BUMP_RUNNING_STATE}, '
+            f'yaw 接近目标角 {math.degrees(float(zone["target_yaw"])):.1f}° '
+            f'持续 {BUMP_HOLD_SECONDS:.1f}s 后, '
+            f'再以固定速度矢量 x={cmd_vel_x:.1f}m/s 前进 '
+            f'(forward_speed={forward_speed:.1f}, cmd_vel_x_sign={cmd_vel_x_sign:+.1f})')
+        self.bump_phase = 'aligning'
+        self.bump_hold_start_time = None
+        self.bump_drive_start_time = None
+        self.bump_drive_twist = Twist()
+        self.bump_drive_twist.linear.x = cmd_vel_x
+        self.bump_drive_twist.linear.y = 0.0
+        self.bump_drive_twist.angular.z = 0.0
+        self.bump_exit_pending_since = None
+
+        # 发布 running_state 切换
+        mode_msg = Int8()
+        mode_msg.data = BUMP_RUNNING_STATE
+        self.chassis_mode_pub.publish(mode_msg)
+
+        # 启动高频覆盖定时器
+        if self.bump_override_timer is None:
+            self.bump_override_timer = self.create_timer(
+                1.0 / BUMP_OVERRIDE_RATE, self._bump_override_callback)
+
+    def _on_leave_bump_zone(self):
+        """离开颠簸区域: 停止覆盖, 恢复底盘模式"""
+        self.get_logger().info('<<< 离开颠簸区域, 恢复正常控制')
+        self.in_bump_zone = False
+        self.active_bump_zone = None
+        self.bump_phase = 'idle'
+        self.bump_hold_start_time = None
+        self.bump_drive_start_time = None
+        self.bump_drive_twist = None
+        self.bump_exit_pending_since = None
+
+        # 停止覆盖定时器
+        if self.bump_override_timer is not None:
+            self.bump_override_timer.cancel()
+            self.destroy_timer(self.bump_override_timer)
+            self.bump_override_timer = None
+
+        # 恢复底盘模式 (发送 0 表示交还给姿态系统)
+        mode_msg = Int8()
+        mode_msg.data = 0
+        self.chassis_mode_pub.publish(mode_msg)
+
+        # 发送一次零速度, 防止惯性
+        stop_msg = Twist()
+        self.cmd_vel_pub.publish(stop_msg)
+
+    def _bump_override_callback(self):
+        """高频定时器: 在颠簸区域内持续发布强制速度指令和目标 yaw 角度。"""
+        if not self.in_bump_zone or self.active_bump_zone is None:
+            return
+
+        target_yaw = float(self.active_bump_zone['target_yaw'])
+        current_yaw_deg = angle_error_deg(target_yaw, self.current_yaw)
+
+        if self.bump_phase == 'aligning':
+            # 对齐阶段持续压零速度，避免导航残留 cmd_vel 与底盘对齐控制互相打架。
+            stop_twist = Twist()
+            self.cmd_vel_pub.publish(stop_twist)
+            if abs(current_yaw_deg) <= BUMP_ALIGN_TOLERANCE_DEG:
+                if self.bump_hold_start_time is None:
+                    self.bump_hold_start_time = time.time()
+                    self.get_logger().info(
+                        f'[BUMP] yaw 已接近目标角 ({current_yaw_deg:.1f}°), 开始连续计时 {BUMP_HOLD_SECONDS:.1f}s')
+                elif time.time() - self.bump_hold_start_time >= BUMP_HOLD_SECONDS:
+                    self.bump_phase = 'driving'
+                    self.bump_drive_start_time = time.time()
+                    self.get_logger().info(
+                        f'[BUMP] yaw 连续稳定 {BUMP_HOLD_SECONDS:.1f}s，开始按固定速度矢量直行 '
+                        f'(x={self.bump_drive_twist.linear.x:.1f}, '
+                        f'y={self.bump_drive_twist.linear.y:.1f}, '
+                        f'w={self.bump_drive_twist.angular.z:.1f})')
+            else:
+                if self.bump_hold_start_time is not None:
+                    self.get_logger().info(
+                        f'[BUMP] yaw 偏离目标角 ({current_yaw_deg:.1f}°), 连续计时清零')
+                self.bump_hold_start_time = None
+
+        if self.bump_phase == 'driving':
+            if self.bump_drive_twist is None:
+                self.bump_drive_twist = Twist()
+                self.bump_drive_twist.linear.x = BUMP_DEFAULT_DRIVE_SPEED
+            self.cmd_vel_pub.publish(self.bump_drive_twist)
+
+        self._publish_selected_yaw()
+
+        # 持续刷新 running_state (确保串口节点保持 running_state=5)
+        mode_msg = Int8()
+        mode_msg.data = BUMP_RUNNING_STATE
+        self.chassis_mode_pub.publish(mode_msg)
+
+    def enemy_targets_callback(self, msg):
+        if not msg.tracking:
+            return
+        self.latest_enemy_yaw = float(msg.yaw)
+
+    def omni_targets_callback(self, msg):
+        if not msg.targets:
+            return
+
+        best_target = min(
+            msg.targets,
+            key=lambda target: (
+                0 if target.is_tracking else 1,
+                int(target.priority),
+                -float(target.confidence)))
+        self.latest_omni_yaw = float(best_target.yaw)
+        self.get_logger().info(
+            f'[全向感知] 目标数={len(msg.targets)}, 选中ID={int(best_target.id)}, '
+            f'跟踪中={bool(best_target.is_tracking)}, 优先级={int(best_target.priority)}, '
+            f'置信度={float(best_target.confidence):.3f}, '
+            f'方位角={self.latest_omni_yaw:.3f}rad / {math.degrees(self.latest_omni_yaw):.1f}deg')
+
+    def goal_pose_callback(self, msg):
+        self.latest_nav_yaw = quaternion_to_yaw(msg.pose.orientation)
+
+    def _publish_selected_yaw(self):
+        selected_yaw = None
+        yaw_source = 'current'
+        omni_sign_flipped = False
+        if self.in_bump_zone:
+            if self.active_bump_zone is not None:
+                selected_yaw = float(self.active_bump_zone['target_yaw'])
+                yaw_source = 'bump_zone_target'
+            else:
+                selected_yaw = self.current_yaw
+                yaw_source = 'current'
+        else:
+            if self.latest_omni_yaw_udp is not None:
+                selected_yaw = -self.latest_omni_yaw_udp * OMNI_YAW_SCALE
+                yaw_source = 'omni_udp'
+                omni_sign_flipped = True
+            elif self.latest_omni_yaw_std is not None:
+                selected_yaw = -self.latest_omni_yaw_std * OMNI_YAW_SCALE
+                yaw_source = 'omni_std'
+                omni_sign_flipped = True
+            elif self.latest_omni_yaw is not None:
+                selected_yaw = -self.latest_omni_yaw * OMNI_YAW_SCALE
+                yaw_source = 'omni'
+                omni_sign_flipped = True
+            elif self.latest_enemy_yaw is not None:
+                selected_yaw = self.latest_enemy_yaw
+                yaw_source = 'enemy_legacy'
+            elif self.latest_nav_yaw is not None:
+                selected_yaw = self.latest_nav_yaw
+                yaw_source = 'nav'
+
+        if selected_yaw is None:
+            selected_yaw = self.current_yaw
+            yaw_source = 'current'
+
+        if yaw_source not in ('omni_udp', 'omni_std'):
+            selected_yaw = float(normalize_angle(selected_yaw))
+        current_yaw_relative = None
+        sent_yaw_deg = None
+        yaw_delta = None
+        if self.start_yaw is not None and self.current_yaw_unwrapped is not None:
+            current_yaw_relative = float(self.current_yaw_unwrapped - self.start_yaw)
+            yaw_delta = float(-current_yaw_relative)
+        if self.in_bump_zone:
+            if self.bump_phase == 'driving':
+                sent_yaw_deg = 0.0
+                yaw_delta = 0.0
+            elif selected_yaw is not None:
+                sent_yaw_deg = float(angle_error_deg(selected_yaw, self.current_yaw))
+                yaw_delta = math.radians(sent_yaw_deg)
+        elif yaw_source == 'omni_udp':
+            sent_yaw_deg = float(selected_yaw)
+        elif yaw_source == 'omni_std':
+            sent_yaw_deg = float(selected_yaw)
+        elif yaw_source == 'omni':
+            sent_yaw_deg = float(math.degrees(selected_yaw))
+        elif self.start_yaw is not None:
+            sent_yaw_deg = float(math.degrees(normalize_angle(selected_yaw - self.start_yaw)))
+        running_state = BUMP_RUNNING_STATE if self.in_bump_zone else 0
+        now = time.time()
+        if now - self.last_mode_log_time >= 0.5:
+            self.last_mode_log_time = now
+            if self.in_bump_zone:
+                mode_name = '颠簸路段底盘对齐模式'
+            elif yaw_source == 'omni_udp':
+                mode_name = '全向感知跟踪模式'
+            elif yaw_source == 'omni_std':
+                mode_name = '全向感知跟踪模式'
+            elif yaw_source == 'omni':
+                mode_name = '全向感知跟踪模式'
+            elif yaw_source == 'enemy_legacy':
+                mode_name = '旧自瞄目标回退模式'
+            elif yaw_source == 'nav':
+                mode_name = '导航目标角回退模式'
+            else:
+                mode_name = '当前车头角回退模式'
+            omni_yaw_str = (
+                'None' if self.latest_omni_yaw is None
+                else f'{self.latest_omni_yaw:.3f} rad / {math.degrees(self.latest_omni_yaw):.1f} deg'
+            )
+            omni_yaw_udp_str = (
+                'None' if self.latest_omni_yaw_udp is None
+                else f'{self.latest_omni_yaw_udp:.1f} deg'
+            )
+            omni_sector_str = (
+                'None' if self.latest_omni_yaw_udp is None
+                else describe_target_sector(self.latest_omni_yaw_udp)
+            )
+            omni_yaw_std_str = (
+                'None' if self.latest_omni_yaw_std is None
+                else f'{self.latest_omni_yaw_std:.1f} deg'
+            )
+            if yaw_source == 'omni_udp':
+                yaw_source_str = '全向感知UDP角'
+            elif yaw_source == 'omni_std':
+                yaw_source_str = '全向感知标准角'
+            elif yaw_source == 'omni':
+                yaw_source_str = '全向感知'
+            elif yaw_source == 'enemy_legacy':
+                yaw_source_str = '旧自瞄目标'
+            elif yaw_source == 'nav':
+                yaw_source_str = '导航目标角'
+            elif yaw_source == 'bump_zone_target':
+                yaw_source_str = '颠簸区目标角'
+            else:
+                yaw_source_str = '当前车头角'
+            self.get_logger().info(
+                f'[模式] 当前模式={mode_name}, 颠簸阶段={self.bump_phase}, '
+                f'角度来源={yaw_source_str}, 全向感知UDP角={omni_yaw_udp_str}, '
+                f'目标方位={omni_sector_str}, 全向感知标准角={omni_yaw_std_str}, '
+                f'全向感知融合角={omni_yaw_str}, 左右修正={"已取反" if omni_sign_flipped else "未取反"}, '
+                f'角度缩放={OMNI_YAW_SCALE:.2f}')
+        if now - self.last_yaw_log_time >= 0.5:
+            self.last_yaw_log_time = now
+            start_yaw_str = 'None' if self.start_yaw is None else '0.0'
+            current_yaw_str = (
+                'None' if current_yaw_relative is None
+                else f'{math.degrees(current_yaw_relative):.1f}'
+            )
+            if self.in_bump_zone:
+                yaw_delta_str = 'None' if sent_yaw_deg is None else f'{sent_yaw_deg:.1f}'
+            else:
+                yaw_delta_str = 'None' if yaw_delta is None else f'{math.degrees(yaw_delta):.1f}'
+            sent_yaw_str = 'None' if sent_yaw_deg is None else f'{sent_yaw_deg:.1f}'
+            turn_direction_str = (
+                'None' if sent_yaw_deg is None else describe_turn_direction(sent_yaw_deg)
+            )
+            self.get_logger().info(
+                f'[控制角] 运行状态={running_state}, 角度来源={yaw_source_str}, '
+                f'启动基准角={start_yaw_str} deg, 当前相对角={current_yaw_str} deg, '
+                f'对齐差值={yaw_delta_str} deg, 下发角度={sent_yaw_str} deg, '
+                f'电控应动作={turn_direction_str}')
+
+        yaw_msg = Float32()
+        yaw_msg.data = 0.0 if sent_yaw_deg is None else sent_yaw_deg
+        self.yaw_angle_pub.publish(yaw_msg)
+
+    def destroy_node(self):
+        self.udp_running = False
+        try:
+            self.udp_socket.close()
+        except OSError:
+            pass
+        super().destroy_node()
+
+    # ================= 可视化辅助 =================
+
+    def _make_polygon_marker(self, marker_id, ns, vertices, timestamp,
+                             inside=False,
+                             color_in=(1.0, 0.0, 0.0),
+                             color_out=(0.0, 1.0, 0.0),
+                             line_width=0.05):
+        """创建多边形线条 Marker"""
+        marker = Marker()
+        marker.header.frame_id = "map"
+        marker.header.stamp = timestamp
+        marker.ns = ns
+        marker.id = marker_id
+        marker.type = Marker.LINE_STRIP
+        marker.action = Marker.ADD
+        marker.scale.x = line_width
+
+        if inside:
+            marker.color.r, marker.color.g, marker.color.b = color_in
+        else:
+            marker.color.r, marker.color.g, marker.color.b = color_out
+        marker.color.a = 1.0
+
+        for vx, vy in vertices:
+            marker.points.append(Point(x=vx, y=vy, z=0.0))
+        marker.points.append(Point(x=vertices[0][0], y=vertices[0][1], z=0.0))
+
+        marker.lifetime.sec = 0
+        marker.lifetime.nanosec = 200000000  # 0.2s
+        return marker
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = RegionMonitorNode()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
