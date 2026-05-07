@@ -14,9 +14,10 @@ pursuit_decision:
     confirm_timeout: 2.0           # 确认窗口时间上限 (s), 10帧必须在2s内完成
 
     # ====== 追击行为 ======
-    goal_update_rate: 5.0          # 追击时导航目标更新频率 (Hz)
+    goal_update_rate: 1.0          # 追击时导航目标更新频率 (Hz)
     max_pursuit_duration: 15.0     # 单次追击最大时长 (s), 超时自动撤退
     target_lost_timeout: 3.0       # 目标丢失超时 (s), 超时结束追击
+    min_goal_change_distance: 0.10 # 新旧goal变化小于此值时不重复发布
 
     # ====== 逼近距离 (按目标类型) ======
     # 不同兵种危险程度不同, 逼近距离应不同
@@ -50,7 +51,7 @@ pursuit_decision:
     # gimbal局部系 -> 导航全局系 的静态修正量 (rad)
     # 主旋转由实时 robot_yaw(TF) 提供；这里的两个参数只保留给外参/装配误差微调。
     world_to_map_yaw_offset: 0.0
-    robot_frame_yaw_offset: 0.0
+    robot_frame_yaw_offset: 0.0        # 双yaw动态链已由 /small_yaw_angle 恢复，这里不再额外补 180°
 
     transform_tolerance: 0.5       # TF查询超时 (s)
 

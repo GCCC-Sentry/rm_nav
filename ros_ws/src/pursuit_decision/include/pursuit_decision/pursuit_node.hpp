@@ -47,6 +47,7 @@ private:
     double goal_update_rate{5.0};            // 追击目标更新频率 (Hz)
     double max_pursuit_duration{15.0};       // 最大追击时长 (s)
     double target_lost_timeout{3.0};         // 目标丢失超时 (s)
+    double min_goal_change_distance{0.10};   // 新旧goal变化小于此值时不重复发布 (m)
 
     // 逼近距离 (按装甲板类型)
     std::unordered_map<int, double> approach_distance{
@@ -157,6 +158,8 @@ private:
   geometry_msgs::msg::Point last_raw_target_map_;
   bool has_last_goal_{false};
   geometry_msgs::msg::PoseStamped last_goal_;
+  bool has_last_published_goal_{false};
+  geometry_msgs::msg::PoseStamped last_published_goal_;
   std::vector<geometry_msgs::msg::Point> last_candidate_points_;
   std::string active_global_frame_id_{"odom"};
   int udp_socket_fd_{-1};
@@ -199,6 +202,7 @@ private:
     double target_x, double target_y,
     double approach_dist,
     geometry_msgs::msg::PoseStamped & goal);
+  bool should_publish_goal(const geometry_msgs::msg::PoseStamped & goal) const;
 
   /// 获取目标类型对应的逼近距离
   double get_approach_distance(int armor_id);

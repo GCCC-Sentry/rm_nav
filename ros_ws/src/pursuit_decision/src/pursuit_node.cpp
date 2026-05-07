@@ -112,6 +112,7 @@ void PursuitNode::declare_and_load_parameters()
   this->declare_parameter("goal_update_rate", params_.goal_update_rate);
   this->declare_parameter("max_pursuit_duration", params_.max_pursuit_duration);
   this->declare_parameter("target_lost_timeout", params_.target_lost_timeout);
+  this->declare_parameter("min_goal_change_distance", params_.min_goal_change_distance);
 
   // 撤退
   this->declare_parameter("hp_retreat_threshold", params_.hp_retreat_threshold);
@@ -159,6 +160,7 @@ void PursuitNode::declare_and_load_parameters()
   this->get_parameter("goal_update_rate", params_.goal_update_rate);
   this->get_parameter("max_pursuit_duration", params_.max_pursuit_duration);
   this->get_parameter("target_lost_timeout", params_.target_lost_timeout);
+  this->get_parameter("min_goal_change_distance", params_.min_goal_change_distance);
   this->get_parameter("hp_retreat_threshold", params_.hp_retreat_threshold);
   this->get_parameter("map_frame_id", params_.map_frame_id);
   this->get_parameter("robot_frame_id", params_.robot_frame_id);
@@ -356,6 +358,21 @@ void PursuitNode::poll_udp_targets()
 
 void PursuitNode::process_aim_target_payload(const std::string & payload, const char * source_tag)
 {
+  if (payload.rfind("small_yaw:", 0) == 0) {
+    try {
+      has_small_yaw_angle_ = true;
+      small_yaw_angle_ = std::stod(payload.substr(std::strlen("small_yaw:")));
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "[small_yaw_angle][%s] UDP值=%.3frad / %.1fdeg",
+        source_tag, small_yaw_angle_, small_yaw_angle_ * 180.0 / M_PI);
+    } catch (...) {
+      RCLCPP_WARN(this->get_logger(),
+        "[small_yaw_angle][%s] 解析失败, raw='%s'",
+        source_tag, payload.c_str());
+    }
+    return;
+  }
+
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
     "[收到自瞄数据][%s] raw: '%s'", source_tag, payload.c_str());
 
@@ -399,27 +416,8 @@ void PursuitNode::process_aim_target_payload(const std::string & payload, const 
   // 全零意味着没有有效目标
   if (std::abs(gimbal_x) < 1e-6 && std::abs(gimbal_y) < 1e-6 && armor_id == 0) {
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-      "[自瞄数据][%s] 收到全零数据，判定为目标丢失，清空观测并停止追击", source_tag);
-    target_validator_.reset();
-    has_last_raw_target_map_ = false;
-    last_candidate_points_.clear();
-    has_last_goal_ = false;
-    if (state_ != PursuitState::IDLE) {
-      transition_to(PursuitState::IDLE);
-    }
-
-    double rx, ry, rz;
-    if (get_robot_position(rx, ry, rz)) {
-      geometry_msgs::msg::PoseStamped hold_goal;
-      hold_goal.header.frame_id = active_global_frame_id_;
-      hold_goal.header.stamp = this->now();
-      hold_goal.pose.position.x = rx;
-      hold_goal.pose.position.y = ry;
-      hold_goal.pose.position.z = 0.0;
-      hold_goal.pose.orientation.w = 1.0;
-      goal_pub_->publish(hold_goal);
-      nav_goal_pose_pub_->publish(hold_goal);
-    }
+      "[自瞄数据][%s] 收到全零数据，判定为本帧无目标；保留最近有效观测，等待 target_lost_timeout 自然超时",
+      source_tag);
     return;
   }
 
@@ -588,18 +586,26 @@ void PursuitNode::decision_callback()
         double approach_dist = get_approach_distance(current_pursuit_target_id_);
         geometry_msgs::msg::PoseStamped goal;
         if (compute_pursuit_goal(tx, ty, approach_dist, goal)) {
-          RCLCPP_INFO(this->get_logger(),
-            "[追击启动] 立即发布第一个goal: (%.2f,%.2f)",
-            goal.pose.position.x, goal.pose.position.y);
           has_last_goal_ = true;
           last_goal_ = goal;
-          goal_history_.header.stamp = goal.header.stamp;
-          goal_history_.poses.push_back(goal);
-          if (goal_history_.poses.size() > 200) {
-            goal_history_.poses.erase(goal_history_.poses.begin());
+          if (should_publish_goal(goal)) {
+            RCLCPP_INFO(this->get_logger(),
+              "[追击启动] 发布第一个goal: (%.2f,%.2f)",
+              goal.pose.position.x, goal.pose.position.y);
+            last_published_goal_ = goal;
+            has_last_published_goal_ = true;
+            goal_history_.header.stamp = goal.header.stamp;
+            goal_history_.poses.push_back(goal);
+            if (goal_history_.poses.size() > 200) {
+              goal_history_.poses.erase(goal_history_.poses.begin());
+            }
+            goal_history_pub_->publish(goal_history_);
+            goal_pub_->publish(goal);
+          } else {
+            RCLCPP_INFO(this->get_logger(),
+              "[追击启动] goal变化过小，抑制重复发布: (%.2f,%.2f)",
+              goal.pose.position.x, goal.pose.position.y);
           }
-          goal_history_pub_->publish(goal_history_);
-          goal_pub_->publish(goal);
         } else {
           RCLCPP_WARN(this->get_logger(), "[追击启动] 首次compute_pursuit_goal失败");
         }
@@ -697,18 +703,26 @@ void PursuitNode::goal_update_callback()
 
   geometry_msgs::msg::PoseStamped goal;
   if (compute_pursuit_goal(tx, ty, approach_dist, goal)) {
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "[目标更新] 发布追击goal: (%.2f,%.2f) -> target(%.2f,%.2f), approach_dist=%.2f",
-      goal.pose.position.x, goal.pose.position.y, tx, ty, approach_dist);
     has_last_goal_ = true;
     last_goal_ = goal;
-    goal_history_.header.stamp = goal.header.stamp;
-    goal_history_.poses.push_back(goal);
-    if (goal_history_.poses.size() > 200) {
-      goal_history_.poses.erase(goal_history_.poses.begin());
+    if (should_publish_goal(goal)) {
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "[目标更新] 发布追击goal: (%.2f,%.2f) -> target(%.2f,%.2f), approach_dist=%.2f",
+        goal.pose.position.x, goal.pose.position.y, tx, ty, approach_dist);
+      last_published_goal_ = goal;
+      has_last_published_goal_ = true;
+      goal_history_.header.stamp = goal.header.stamp;
+      goal_history_.poses.push_back(goal);
+      if (goal_history_.poses.size() > 200) {
+        goal_history_.poses.erase(goal_history_.poses.begin());
+      }
+      goal_history_pub_->publish(goal_history_);
+      goal_pub_->publish(goal);
+    } else {
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "[目标更新] goal变化过小，抑制重复发布: (%.2f,%.2f)",
+        goal.pose.position.x, goal.pose.position.y);
     }
-    goal_history_pub_->publish(goal_history_);
-    goal_pub_->publish(goal);
   } else {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
       "[目标更新] compute_pursuit_goal失败, target=(%.2f,%.2f)", tx, ty);
@@ -852,8 +866,17 @@ bool PursuitNode::should_retreat()
 
 bool PursuitNode::get_robot_position(double & x, double & y, double & z)
 {
+  const std::array<std::string, 2> global_frames{
+    params_.map_frame_id, params_.fallback_map_frame_id};
+  // 位置参考优先使用底盘/车体固定 frame，避免云台/雷达 yaw 旋转时原点跟着绕圈。
+  const std::array<std::string, 2> robot_frames{
+    params_.fallback_robot_frame_id, params_.robot_frame_id};
+
   auto try_lookup =
     [&](const std::string & target_frame, const std::string & source_frame) -> bool {
+      if (target_frame.empty() || source_frame.empty()) {
+        return false;
+      }
       try {
         auto transform = tf_buffer_->lookupTransform(
           target_frame, source_frame,
@@ -870,17 +893,12 @@ bool PursuitNode::get_robot_position(double & x, double & y, double & z)
       }
     };
 
-  if (try_lookup(params_.map_frame_id, params_.robot_frame_id)) {
-    return true;
-  }
-  if (try_lookup(params_.fallback_map_frame_id, params_.robot_frame_id)) {
-    return true;
-  }
-  if (try_lookup(params_.map_frame_id, params_.fallback_robot_frame_id)) {
-    return true;
-  }
-  if (try_lookup(params_.fallback_map_frame_id, params_.fallback_robot_frame_id)) {
-    return true;
+  for (const auto & global_frame : global_frames) {
+    for (const auto & robot_frame : robot_frames) {
+      if (try_lookup(global_frame, robot_frame)) {
+        return true;
+      }
+    }
   }
 
   try {
@@ -904,8 +922,17 @@ bool PursuitNode::gimbal_vector_to_map(
   double gimbal_x, double gimbal_y, double gimbal_z,
   double & mx, double & my, double & mz)
 {
+  const std::array<std::string, 2> global_frames{
+    params_.map_frame_id, params_.fallback_map_frame_id};
+  // 用固定车体 frame 做平移与零位锁定，避免大/小 yaw 旋转时参考原点本身移动。
+  const std::array<std::string, 2> robot_frames{
+    params_.fallback_robot_frame_id, params_.robot_frame_id};
+
   auto try_lookup =
     [&](const std::string & target_frame, const std::string & source_frame) -> bool {
+      if (target_frame.empty() || source_frame.empty()) {
+        return false;
+      }
       try {
         auto transform = tf_buffer_->lookupTransform(
           target_frame, source_frame,
@@ -923,9 +950,9 @@ bool PursuitNode::gimbal_vector_to_map(
           return false;
         }
 
-        // /small_yaw_angle 的零点定义:
-        // 上电时大小yaw共线，因此它表示“小yaw相对上电零位”的绝对角。
-        // 这里在第一次收到有效TF时，记住那一刻“大yaw全局角”，作为小yaw零位的全局角。
+        // /small_yaw_angle 现在统一语义为：
+        // “小yaw全局角相对上电零位的变化量”。
+        // 上电时大小yaw共线，因此第一次拿到有效大yaw全局角时，记作小yaw零位的全局角。
         if (!has_small_yaw_zero_global_) {
           small_yaw_zero_global_ = robot_yaw;
           has_small_yaw_zero_global_ = true;
@@ -941,28 +968,33 @@ bool PursuitNode::gimbal_vector_to_map(
         const double cos_off = std::cos(total_yaw);
         const double sin_off = std::sin(total_yaw);
 
-        // xyz_in_gimbal: x前/y左/z上
-        mx = rx + cos_off * gimbal_x - sin_off * gimbal_y;
-        my = ry + sin_off * gimbal_x + cos_off * gimbal_y;
+        // 当前现场对“前后/左右”的定义与 solver 的 gimbal 局部系相反：
+        // RViz/导航侧以 -x 为前、-y 为左，因此在送入导航平面前统一翻转 x/y。
+        const double local_x = -gimbal_x;
+        const double local_y = -gimbal_y;
+        mx = rx + cos_off * local_x - sin_off * local_y;
+        my = ry + sin_off * local_x + cos_off * local_y;
         mz = rz + gimbal_z;
         active_global_frame_id_ = target_frame;
 
-        RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-          "[坐标转换] robot_global=(%.2f,%.2f,%.2f), big_yaw_global=%.3f, small_yaw_zero_global=%.3f, small_yaw_angle=%.3f, small_yaw_global=%.3f, world_to_map_yaw_offset=%.3f, robot_frame_yaw_offset=%.3f, total_yaw=%.3f, gimbal_vec=(%.2f,%.2f,%.2f) -> target_global=(%.2f,%.2f,%.2f)",
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+          "[DualYaw坐标转换] robot=(%.2f,%.2f,%.2f), big_yaw_global=%.3f, small_yaw_zero_global=%.3f, small_yaw_angle=%.3f, small_yaw_global=%.3f, total_yaw=%.3f, gimbal_vec=(%.2f,%.2f,%.2f), local_vec=(%.2f,%.2f) -> target_global=(%.2f,%.2f,%.2f)",
           rx, ry, rz, robot_yaw, small_yaw_zero_global_, small_yaw_angle_, small_yaw_global,
-          params_.world_to_map_yaw_offset,
-          params_.robot_frame_yaw_offset, total_yaw,
-          gimbal_x, gimbal_y, gimbal_z, mx, my, mz);
+          total_yaw,
+          gimbal_x, gimbal_y, gimbal_z, local_x, local_y, mx, my, mz);
         return true;
       } catch (const tf2::TransformException &) {
         return false;
       }
     };
 
-  if (try_lookup(params_.map_frame_id, params_.robot_frame_id)) return true;
-  if (try_lookup(params_.fallback_map_frame_id, params_.robot_frame_id)) return true;
-  if (try_lookup(params_.map_frame_id, params_.fallback_robot_frame_id)) return true;
-  if (try_lookup(params_.fallback_map_frame_id, params_.fallback_robot_frame_id)) return true;
+  for (const auto & global_frame : global_frames) {
+    for (const auto & robot_frame : robot_frames) {
+      if (try_lookup(global_frame, robot_frame)) {
+        return true;
+      }
+    }
+  }
 
   RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
     "[坐标转换] 无法获取机器人姿态, 无法进行gimbal->map变换");
@@ -1001,6 +1033,18 @@ bool PursuitNode::compute_pursuit_goal(
   return true;
 }
 
+bool PursuitNode::should_publish_goal(const geometry_msgs::msg::PoseStamped & goal) const
+{
+  if (!has_last_published_goal_) {
+    return true;
+  }
+
+  const double dx = goal.pose.position.x - last_published_goal_.pose.position.x;
+  const double dy = goal.pose.position.y - last_published_goal_.pose.position.y;
+  const double dist = std::sqrt(dx * dx + dy * dy);
+  return dist >= params_.min_goal_change_distance;
+}
+
 double PursuitNode::get_approach_distance(int armor_id)
 {
   auto it = params_.approach_distance.find(armor_id);
@@ -1037,6 +1081,7 @@ void PursuitNode::transition_to(PursuitState new_state)
     current_pursuit_target_id_ = -1;
     target_validator_.reset();
     has_last_goal_ = false;
+    has_last_published_goal_ = false;
     has_last_raw_target_map_ = false;
     last_candidate_points_.clear();
   }
