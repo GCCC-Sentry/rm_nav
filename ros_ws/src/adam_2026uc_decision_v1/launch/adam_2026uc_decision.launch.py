@@ -21,8 +21,8 @@ def generate_launch_description():
                 'spin_speed': 7.0,             # 小陀螺转速 rad/s
                 'loop_rate_hz': 10.0,          # 主循环频率
                 'stance_hp_threshold': 201,    # HP > 201 为进攻, 否则移动
-                'attack_stance_duration_sec': 170.0,  # 2分50秒后临时切防御
-                'defense_stance_duration_sec': 8.0,   # 防御8秒后恢复进攻
+                'attack_stance_duration_sec': 5.0,    # 进攻5秒后切到移动
+                'move_stance_duration_sec': 8.0,      # 移动8秒后恢复进攻
             }],
         ),
     ])

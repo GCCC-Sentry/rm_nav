@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  RMUL 2026 哨兵策略:
+  1. 等待比赛开始
+  2. 低风险路点导航到颠簸区前的集结点
+  3. 再发一个穿越/中心战场目标, 进入颠簸区域后交给 pb2025_region_monitor 接管底盘对齐与通过
+  4. HP < 201 / Ammo < 20 / 死亡后复活, 全部回补给区
+  5. 死亡恢复后必须重新回补给区, 用于占领补给区解除“虚弱”并恢复发射机构
+
+  当前默认坐标基于仓库内现有 RMUL 小坐标系推定, 如需修正优先改这里:
+  - 集结点: (-2.50, -4.90, 0.00)
+  - 穿越后中心战场目标: (3.80, 0.00, 0.00)
+  - 补给点: (2.80, 0.13, 0.00)
+-->
+<root BTCPP_format="4">
+
+  <BehaviorTree ID="wait_for_game_start">
+    <RetryUntilSuccessful num_attempts="-1">
+      <Sequence>
+        <Sleep msec="1000"/>
+        <IsGameStatus name="CheckGameRunning"
+                      max_remain_time="420"
+                      min_remain_time="0"
+                      expected_game_progress="4"
+                      key_port="{@referee_gameStatus}"/>
+      </Sequence>
+    </RetryUntilSuccessful>
+  </BehaviorTree>
+
+  <BehaviorTree ID="wait_for_respawn">
+    <Sequence>
+      <PublishSpinSpeed spin_speed="0.0" duration="0" topic_name="cmd_spin"/>
+      <PublishTwist v_x="0.0" v_y="0.0" v_yaw="0.0" duration="0" topic_name="cmd_vel"/>
+      <RetryUntilSuccessful num_attempts="-1">
+        <Sequence>
+          <Sleep msec="1000"/>
+          <IsStatusOK ammo_min="0"
+                      heat_max="999999"
+                      hp_min="1"
+                      key_port="{@referee_robotStatus}"/>
+        </Sequence>
+      </RetryUntilSuccessful>
+    </Sequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="supply_recovery">
+    <Sequence>
+      <PublishSpinSpeed spin_speed="0.0" duration="0" topic_name="cmd_spin"/>
+      <Sleep msec="800"/>
+      <RetryUntilSuccessful num_attempts="3">
+        <SendNav2Goal x="2.8" y="0.13" yaw="0.0" action_name="navigate_to_pose"/>
+      </RetryUntilSuccessful>
+
+      <!-- 先确认确实占到了补给区, 死亡后这里用于解除“虚弱” -->
+      <RetryUntilSuccessful num_attempts="-1">
+        <Sequence>
+          <Sleep msec="500"/>
+          <IsRfidDetected friendly_supply_zone_exchange="false"
+                          friendly_supply_zone_non_exchange="true"
+                          center_gain_point="false"
+                          key_port="{@referee_rfidStatus}"/>
+        </Sequence>
+      </RetryUntilSuccessful>
+
+      <!-- 等待回血/弹丸恢复到安全阈值; 弹丸补给是分钟级, 给足等待窗口 -->
+      <Fallback>
+        <Timeout msec="65000">
+          <RetryUntilSuccessful num_attempts="-1">
+            <Sequence>
+              <Sleep msec="1000"/>
+              <IsStatusOK ammo_min="20"
+                          heat_max="999999"
+                          hp_min="201"
+                          key_port="{@referee_robotStatus}"/>
+            </Sequence>
+          </RetryUntilSuccessful>
+        </Timeout>
+        <AlwaysSuccess/>
+      </Fallback>
+
+      <PublishSpinSpeed spin_speed="7.0" duration="0" topic_name="cmd_spin"/>
+    </Sequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="recover_after_death">
+    <Sequence>
+      <SubTree ID="wait_for_respawn"/>
+      <Sleep msec="500"/>
+      <SubTree ID="supply_recovery"/>
+    </Sequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="route_to_center_battlefield">
+    <Sequence>
+      <!-- 阶段 1: 先走到颠簸区前集结点 -->
+      <RetryUntilSuccessful num_attempts="3">
+        <SendNav2Goal x="-2.5" y="-4.9" yaw="0.0" action_name="navigate_to_pose"/>
+      </RetryUntilSuccessful>
+
+      <Sleep msec="500"/>
+
+      <!-- 阶段 2: 发穿越后的中心战场目标, 进入颠簸区后由 region_monitor 接管底盘对齐 -->
+      <RetryUntilSuccessful num_attempts="3">
+        <SendNav2Goal x="3.8" y="0.0" yaw="0.0" action_name="navigate_to_pose"/>
+      </RetryUntilSuccessful>
+
+      <!-- 到达中心后持续驻留, 直到上层因血量/弹丸/死亡打断 -->
+      <KeepRunningUntilFailure>
+        <Sequence>
+          <Sleep msec="1000"/>
+          <AlwaysSuccess/>
+        </Sequence>
+      </KeepRunningUntilFailure>
+    </Sequence>
+  </BehaviorTree>
+
+  <BehaviorTree ID="rmul_2026_bump_supply_center">
+    <RetryUntilSuccessful num_attempts="-1">
+      <Sequence>
+        <SubTree ID="wait_for_game_start"/>
+        <PublishSpinSpeed spin_speed="7.0" duration="0" topic_name="cmd_spin"/>
+
+        <!-- 优先级:
+             1. 死亡 -> 等复活 -> 回补给区解除虚弱/解锁发射机构
+             2. 低血或低弹 -> 回补给区
+             3. 正常 -> 执行路点任务并驻留中心 -->
+        <ReactiveFallback>
+          <Sequence>
+            <Inverter>
+              <IsStatusOK ammo_min="0"
+                          heat_max="999999"
+                          hp_min="1"
+                          key_port="{@referee_robotStatus}"/>
+            </Inverter>
+            <SubTree ID="recover_after_death"/>
+          </Sequence>
+
+          <Sequence>
+            <Inverter>
+              <IsStatusOK ammo_min="20"
+                          heat_max="999999"
+                          hp_min="201"
+                          key_port="{@referee_robotStatus}"/>
+            </Inverter>
+            <SubTree ID="supply_recovery"/>
+          </Sequence>
+
+          <SubTree ID="route_to_center_battlefield"/>
+        </ReactiveFallback>
+      </Sequence>
+    </RetryUntilSuccessful>
+  </BehaviorTree>
+
+</root>

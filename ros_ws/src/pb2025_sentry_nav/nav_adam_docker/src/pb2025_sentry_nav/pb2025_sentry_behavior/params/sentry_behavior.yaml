@@ -31,8 +31,8 @@ pb2025_sentry_behavior_client:
     use_sim_time: true
     # ═══════════════════════════════════════════════════════════
     # target_tree 必须与上面 behavior_trees 目录中的 XML 对应:
-    #   rmul/ → rmul_2026_patrol
+    #   rmul/ → rmul_2026_bump_supply_center
     #   rmuc/ → rmuc_2025_with_stance
     # ═══════════════════════════════════════════════════════════
-    target_tree: rmul_2026_center_spin
+    target_tree: rmul_2026_bump_supply_center
     # target_tree: rmuc_2025_with_stance

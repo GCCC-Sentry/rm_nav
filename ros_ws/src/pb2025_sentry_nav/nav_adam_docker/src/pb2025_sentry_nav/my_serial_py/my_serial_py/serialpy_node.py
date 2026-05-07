@@ -1417,7 +1417,7 @@ import struct
 import threading
 import time
 import libscrc
-from std_msgs.msg import Int8, Float32
+from std_msgs.msg import Int8, Float32, UInt32
 from geometry_msgs.msg import Twist
 
 # 导入自定义接口
@@ -1429,14 +1429,9 @@ except ImportError:
     print("Error: pb_rm_interfaces not found. 请确保工作空间已编译。")
     exit(1)
 
-# 姿态 ID → 下位机 running_state 映射
+# /cmd_stance 直接发布下位机 running_state
 # 注意: 1/2/3 专用于姿态切换, 5 专用于颠簸区域底盘对齐 (由 region_monitor 发送)
 # 两套逻辑互不干扰: 姿态走 /cmd_stance, 颠簸区域走 /cmd_chassis_mode
-STANCE_TO_RUNNING_STATE = {
-    0: 1,   # 移动姿态  (running_state=1)
-    1: 2,   # 进攻姿态  (running_state=2)
-    2: 3,   # 防御姿态  (running_state=3)
-}
 
 # ================= RoboMaster 官方 CRC16 查表算法 =================
 W_CRC_TABLE = [
@@ -1500,7 +1495,7 @@ class SerialNode(Node):
         self.serial_conn = None
         self.running = True
         self.chassis_mode = 0
-        self.stance_running_state = 1  # 默认移动姿态 (running_state=1)
+        self.stance_running_state = 3  # 默认移动姿态 (running_state=3)
         self.yaw_angle = 0.0  # 来自 /cmd_yaw_angle 的独立 yaw 角度(单位: deg)
         self.latest_x = 0.0   # 缓存最新 cmd_vel
         self.latest_y = 0.0
@@ -1518,8 +1513,9 @@ class SerialNode(Node):
 
     def create_subscribers(self):
         self.cmd_vel_sub = self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_callback, 10)
+        # 临时禁用 /cmd_chassis_mode 对 running_state 的覆盖，避免把姿态 1/3 顶掉成 5
         self.mode_sub = self.create_subscription(Int8, '/cmd_chassis_mode', self.chassis_mode_callback, 10)
-        self.stance_sub = self.create_subscription(Float32, '/cmd_stance', self.stance_callback, 10)
+        self.stance_sub = self.create_subscription(UInt32, '/cmd_stance', self.stance_callback, 10)
         self.yaw_angle_sub = self.create_subscription(Float32, '/cmd_yaw_angle', self.yaw_angle_callback, 10)
 
     def create_publishers(self):
@@ -1620,6 +1616,9 @@ class SerialNode(Node):
             return False
 
     def chassis_mode_callback(self, msg):
+        # 暂时忽略 region_monitor 发来的底盘模式覆盖。
+        # 如需恢复旧逻辑，只需重新使用 msg.data 覆盖 self.chassis_mode。
+        return
         self.chassis_mode = msg.data
 
     def yaw_angle_callback(self, msg):
@@ -1633,14 +1632,13 @@ class SerialNode(Node):
         self.latest_y = msg.linear.y
 
     def stance_callback(self, msg):
-        """接收行为树姿态指令, 映射为下位机 running_state"""
-        stance_id = int(msg.data)
-        new_state = STANCE_TO_RUNNING_STATE.get(stance_id, 1)
+        """接收 /cmd_stance 直接下发的 running_state。"""
+        new_state = int(msg.data)
         if new_state != self.stance_running_state:
             self.stance_running_state = new_state
-            stance_names = {1: '移动', 2: '进攻', 3: '防御'}
+            stance_names = {1: '进攻', 2: '防御', 3: '移动'}
             self.get_logger().info(
-                f'姿态切换: stance_id={stance_id} -> running_state={new_state} '
+                f'姿态切换: running_state={new_state} '
                 f'({stance_names.get(new_state, "未知")})')
 
     def periodic_send_to_stm32(self):
@@ -1648,7 +1646,8 @@ class SerialNode(Node):
         if not (self.serial_conn and self.serial_conn.is_open): return
         try:
             header = 0xAA
-            running_state = self.stance_running_state if self.chassis_mode == 0 else self.chassis_mode
+            # 暂时只透传 /cmd_stance，禁用 /cmd_chassis_mode 覆盖。
+            running_state = self.stance_running_state
             x_val = float(-self.latest_x * 1.0)
             y_val = float(-self.latest_y * 1.0)
             yaw_val = float(self.yaw_angle)
@@ -1670,13 +1669,16 @@ class SerialNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = SerialNode()
+    node = None
     try:
+        node = SerialNode()
         rclpy.spin(node)
     except KeyboardInterrupt: pass
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
