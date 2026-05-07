@@ -13,6 +13,7 @@
 #include "pursuit_decision/target_validator.hpp"
 #include "pursuit_decision/zone_manager.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "std_msgs/msg/float32.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
@@ -113,6 +114,7 @@ private:
 
   // ===================== Subscribers =====================
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr aim_target_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr small_yaw_angle_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr robot_status_sub_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr game_status_sub_;
   rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr costmap_sub_;
@@ -146,6 +148,10 @@ private:
 
   nav_msgs::msg::OccupancyGrid::SharedPtr costmap_;
   nav_msgs::msg::Path goal_history_;
+  bool has_small_yaw_angle_{false};
+  double small_yaw_angle_{0.0};
+  bool has_small_yaw_zero_global_{false};
+  double small_yaw_zero_global_{0.0};
 
   bool has_last_raw_target_map_{false};
   geometry_msgs::msg::Point last_raw_target_map_;
@@ -157,6 +163,7 @@ private:
 
   // ===================== 回调 =====================
   void on_aim_target(const std_msgs::msg::String::SharedPtr msg);
+  void on_small_yaw_angle(const std_msgs::msg::Float32::SharedPtr msg);
   void on_robot_status(const std_msgs::msg::String::SharedPtr msg);
   void on_game_status(const std_msgs::msg::String::SharedPtr msg);
   void on_costmap(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);

@@ -22,6 +22,7 @@ def generate_launch_description():
         remappings=[
             # 自瞄发来的目标信息
             ('auto_aim_target_pos', 'auto_aim_target_pos'),
+            ('small_yaw_angle', 'small_yaw_angle'),
             # 裁判系统状态
             ('pursuit/robot_status', 'referee/robot_status'),
             ('pursuit/game_status', 'referee/game_status'),

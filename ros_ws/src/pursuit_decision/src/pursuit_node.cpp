@@ -40,6 +40,10 @@ PursuitNode::PursuitNode(const rclcpp::NodeOptions & options)
     "auto_aim_target_pos", rclcpp::SensorDataQoS(),
     std::bind(&PursuitNode::on_aim_target, this, std::placeholders::_1));
 
+  small_yaw_angle_sub_ = this->create_subscription<std_msgs::msg::Float32>(
+    "small_yaw_angle", 10,
+    std::bind(&PursuitNode::on_small_yaw_angle, this, std::placeholders::_1));
+
   // 裁判系统数据 - 使用通用String topic, 可按实际情况替换为具体msg类型
   robot_status_sub_ = this->create_subscription<std_msgs::msg::String>(
     "pursuit/robot_status", 10,
@@ -279,6 +283,15 @@ void PursuitNode::initialize_zones()
 void PursuitNode::on_aim_target(const std_msgs::msg::String::SharedPtr msg)
 {
   process_aim_target_payload(msg->data, "ros2");
+}
+
+void PursuitNode::on_small_yaw_angle(const std_msgs::msg::Float32::SharedPtr msg)
+{
+  has_small_yaw_angle_ = true;
+  small_yaw_angle_ = static_cast<double>(msg->data);
+  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+    "[small_yaw_angle] 当前值=%.3frad / %.1fdeg",
+    small_yaw_angle_, small_yaw_angle_ * 180.0 / M_PI);
 }
 
 bool PursuitNode::setup_udp_socket()
@@ -903,8 +916,28 @@ bool PursuitNode::gimbal_vector_to_map(
         const double ry = transform.transform.translation.y;
         const double rz = transform.transform.translation.z;
         const double robot_yaw = tf2::getYaw(transform.transform.rotation);
+
+        if (!has_small_yaw_angle_) {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+            "[坐标转换] 尚未收到 /small_yaw_angle，无法恢复小yaw全局角");
+          return false;
+        }
+
+        // /small_yaw_angle 的零点定义:
+        // 上电时大小yaw共线，因此它表示“小yaw相对上电零位”的绝对角。
+        // 这里在第一次收到有效TF时，记住那一刻“大yaw全局角”，作为小yaw零位的全局角。
+        if (!has_small_yaw_zero_global_) {
+          small_yaw_zero_global_ = robot_yaw;
+          has_small_yaw_zero_global_ = true;
+          RCLCPP_INFO(this->get_logger(),
+            "[DualYaw] 锁定 small_yaw 零位全局角: %.3frad / %.1fdeg",
+            small_yaw_zero_global_, small_yaw_zero_global_ * 180.0 / M_PI);
+        }
+
+        const double small_yaw_global =
+          small_yaw_zero_global_ + small_yaw_angle_;
         const double total_yaw =
-          robot_yaw + params_.robot_frame_yaw_offset + params_.world_to_map_yaw_offset;
+          small_yaw_global + params_.robot_frame_yaw_offset + params_.world_to_map_yaw_offset;
         const double cos_off = std::cos(total_yaw);
         const double sin_off = std::sin(total_yaw);
 
@@ -915,8 +948,9 @@ bool PursuitNode::gimbal_vector_to_map(
         active_global_frame_id_ = target_frame;
 
         RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-          "[坐标转换] robot_global=(%.2f,%.2f,%.2f), robot_yaw=%.3f, world_to_map_yaw_offset=%.3f, robot_frame_yaw_offset=%.3f, total_yaw=%.3f, gimbal_vec=(%.2f,%.2f,%.2f) -> target_global=(%.2f,%.2f,%.2f)",
-          rx, ry, rz, robot_yaw, params_.world_to_map_yaw_offset,
+          "[坐标转换] robot_global=(%.2f,%.2f,%.2f), big_yaw_global=%.3f, small_yaw_zero_global=%.3f, small_yaw_angle=%.3f, small_yaw_global=%.3f, world_to_map_yaw_offset=%.3f, robot_frame_yaw_offset=%.3f, total_yaw=%.3f, gimbal_vec=(%.2f,%.2f,%.2f) -> target_global=(%.2f,%.2f,%.2f)",
+          rx, ry, rz, robot_yaw, small_yaw_zero_global_, small_yaw_angle_, small_yaw_global,
+          params_.world_to_map_yaw_offset,
           params_.robot_frame_yaw_offset, total_yaw,
           gimbal_x, gimbal_y, gimbal_z, mx, my, mz);
         return true;
