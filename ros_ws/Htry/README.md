@@ -22,11 +22,11 @@ The current purpose of this directory is to hold an isolated working copy of the
 
 1. `region_monitor_node` detects whether the robot is inside a configured bump zone.
 2. When the robot enters a bump zone, the node:
-   - forces `running_state=5` through `/cmd_chassis_mode`
+   - publishes `region=1` through `/region`
    - keeps publishing a target yaw through `/cmd_yaw_angle`
    - waits for yaw alignment to remain stable for a configured duration
    - then publishes a fixed `Twist` on `/cmd_vel` to drive across the bump
-3. The serial bridge node converts `/cmd_vel`, `/cmd_yaw_angle`, and `/cmd_chassis_mode` into the packet sent to STM32.
+3. The serial bridge node converts `/cmd_vel`, `/cmd_yaw_angle`, `/cmd_stance`, and `/region` into the packet sent to STM32.
 4. STM32 executes the final chassis motion.
 
 ### Relevant implementation links
@@ -51,7 +51,7 @@ Core responsibilities:
 - Publish:
   - `/cmd_vel`
   - `/cmd_yaw_angle`
-  - `/cmd_chassis_mode`
+  - `/region`
 - Read:
   - TF: `map -> base_footprint`
   - `/omni_yaw_angle`
@@ -83,12 +83,19 @@ The traversal flow is:
 
 Behavior details:
 
-1. When entering a bump zone, the node publishes `running_state=5`.
+1. When entering a bump zone, the node publishes `region=1`.
 2. During `aligning`, it keeps `/cmd_vel` at zero to avoid fighting other motion sources.
 3. It checks yaw error against `target_yaw`.
 4. Once yaw stays inside tolerance for `BUMP_HOLD_SECONDS`, it switches to `driving`.
 5. During `driving`, it repeatedly publishes the fixed traversal `Twist`.
-6. When the zone is left and debounce conditions pass, it restores normal mode and publishes a stop command once.
+6. When the zone is left and debounce conditions pass, it publishes `region=0` and a stop command once.
+
+### Region signaling
+
+- `/region` is now the dedicated bump-zone state topic sent by `region_monitor_node`.
+- `region=0`: not in a bump zone
+- `region=1`: currently in a bump zone
+- In the serial bridge packet, this value is forwarded through the reserved extension slot `ext0`.
 
 ## Root Cause of "Should Move Forward But Actually Moves Backward"
 
@@ -204,6 +211,7 @@ Before field testing:
 2. Confirm the running serial bridge still contains the `x_val = -self.latest_x` convention.
 3. Enter `bump_zone_1` and watch logs for:
    - bump-zone entry
+   - `/region` switching to `1`
    - yaw alignment hold
    - transition to `driving`
    - published traversal `linear.x`

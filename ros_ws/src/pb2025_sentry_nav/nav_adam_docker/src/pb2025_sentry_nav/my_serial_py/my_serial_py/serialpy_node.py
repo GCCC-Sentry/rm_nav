@@ -1496,9 +1496,13 @@ class SerialNode(Node):
         self.running = True
         self.chassis_mode = 0
         self.stance_running_state = 3  # 默认移动姿态 (running_state=3)
+        self.region_code = 0          # /region 下发的区域编码，0=普通区域
         self.yaw_angle = 0.0  # 来自 /cmd_yaw_angle 的独立 yaw 角度(单位: deg)
         self.latest_x = 0.0   # 缓存最新 cmd_vel
         self.latest_y = 0.0
+        # 预留给后续 ROS -> STM32 扩展通信的 10 个 float 槽位。
+        # 约定 ext0 承载 region 编码，其余 ext1-ext9 先固定发 1.0。
+        self.tx_reserved_fields = [1.0] * 10
 
         self.create_subscribers()
         self.create_publishers()
@@ -1517,6 +1521,7 @@ class SerialNode(Node):
         self.mode_sub = self.create_subscription(Int8, '/cmd_chassis_mode', self.chassis_mode_callback, 10)
         self.stance_sub = self.create_subscription(UInt32, '/cmd_stance', self.stance_callback, 10)
         self.yaw_angle_sub = self.create_subscription(Float32, '/cmd_yaw_angle', self.yaw_angle_callback, 10)
+        self.region_sub = self.create_subscription(Int8, '/region', self.region_callback, 10)
 
     def create_publishers(self):
         # 使用绝对路径发布话题，供行为树使用
@@ -1626,6 +1631,10 @@ class SerialNode(Node):
         self.yaw_angle = msg.data
         self.get_logger().debug(f'[yaw_angle] 收到: {msg.data:.3f}')
 
+    def region_callback(self, msg):
+        """接收区域编码并透传给 STM32 扩展字段 ext0。"""
+        self.region_code = int(msg.data)
+
     def cmd_vel_callback(self, msg):
         """缓存最新的 cmd_vel xy 速度"""
         self.latest_x = msg.linear.x
@@ -1651,11 +1660,18 @@ class SerialNode(Node):
             x_val = float(-self.latest_x * 1.0)
             y_val = float(-self.latest_y * 1.0)
             yaw_val = float(self.yaw_angle)
-            # 保持下位机原有 4 个 float 的报文结构不变，只把原 yaw 速度改成 yaw 角度。
-            payload = struct.pack('<BffffB', header,
-                                  x_val, y_val,
-                                  yaw_val, yaw_val,
-                                  int(running_state))
+            self.tx_reserved_fields[0] = float(self.region_code)
+            # 扩展 ROS -> STM32 报文，额外预留 10 个 float 槽位供后续复用。
+            payload = struct.pack(
+                '<BffffB10f',
+                header,
+                x_val,
+                y_val,
+                yaw_val,
+                yaw_val,
+                int(running_state),
+                *self.tx_reserved_fields,
+            )
             crc_val = libscrc.modbus(payload)
             final_packet = payload + struct.pack('<H', crc_val)
             self.serial_conn.write(final_packet)

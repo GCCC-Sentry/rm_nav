@@ -56,9 +56,9 @@ BUMP_ZONES = [
 # 颠簸区域覆盖发送频率 (Hz)
 BUMP_OVERRIDE_RATE = 50.0
 
-# 进入颠簸区域时发给 /cmd_chassis_mode 的 running_state 值
-# 注意: running_state=5 专用于颠簸区域底盘 yaw 对齐, 与姿态切换 (1/2/3) 是两套独立逻辑
-BUMP_RUNNING_STATE = 5  # 颠簸区域底盘对齐模式 (非姿态切换)
+# 进入颠簸区域时通过 /region 下发给串口节点的区域编号。
+# 目前 0 表示普通区域，1 表示颠簸区域；后续可继续扩展更多区域编码。
+BUMP_REGION_CODE = 1
 BUMP_ALIGN_TOLERANCE_DEG = 3.0
 BUMP_HOLD_SECONDS = 10.0
 BUMP_DEFAULT_DRIVE_SPEED = 1.0
@@ -147,7 +147,7 @@ class RegionMonitorNode(Node):
         # ===== 颠簸区域穿越: 发布控制指令 =====
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.yaw_angle_pub = self.create_publisher(Float32, '/cmd_yaw_angle', 10)
-        self.chassis_mode_pub = self.create_publisher(Int8, '/cmd_chassis_mode', 10)
+        self.region_pub = self.create_publisher(Int8, '/region', 10)
         self.omni_yaw_sub = self.create_subscription(
             Float32, '/omni_yaw_angle', self.omni_yaw_callback, 10)
         self.omni_targets_sub = None
@@ -349,7 +349,7 @@ class RegionMonitorNode(Node):
 
         self.get_logger().warn(
             f'>>> 进入颠簸区域 [{zone["name"]}]! '
-            f'强制 running_state={BUMP_RUNNING_STATE}, '
+            f'下发 region={BUMP_REGION_CODE}, '
             f'yaw 接近目标角 {math.degrees(float(zone["target_yaw"])):.1f}° '
             f'持续 {BUMP_HOLD_SECONDS:.1f}s 后, '
             f'再以固定速度矢量 x={cmd_vel_x:.1f}m/s 前进 '
@@ -363,10 +363,9 @@ class RegionMonitorNode(Node):
         self.bump_drive_twist.angular.z = 0.0
         self.bump_exit_pending_since = None
 
-        # 发布 running_state 切换
-        mode_msg = Int8()
-        mode_msg.data = BUMP_RUNNING_STATE
-        self.chassis_mode_pub.publish(mode_msg)
+        region_msg = Int8()
+        region_msg.data = BUMP_REGION_CODE
+        self.region_pub.publish(region_msg)
 
         # 启动高频覆盖定时器
         if self.bump_override_timer is None:
@@ -390,10 +389,9 @@ class RegionMonitorNode(Node):
             self.destroy_timer(self.bump_override_timer)
             self.bump_override_timer = None
 
-        # 恢复底盘模式 (发送 0 表示交还给姿态系统)
-        mode_msg = Int8()
-        mode_msg.data = 0
-        self.chassis_mode_pub.publish(mode_msg)
+        region_msg = Int8()
+        region_msg.data = 0
+        self.region_pub.publish(region_msg)
 
         # 发送一次零速度, 防止惯性
         stop_msg = Twist()
@@ -438,10 +436,10 @@ class RegionMonitorNode(Node):
 
         self._publish_selected_yaw()
 
-        # 持续刷新 running_state (确保串口节点保持 running_state=5)
-        mode_msg = Int8()
-        mode_msg.data = BUMP_RUNNING_STATE
-        self.chassis_mode_pub.publish(mode_msg)
+        # 持续刷新 region 编码，确保串口节点稳定收到当前区域状态。
+        region_msg = Int8()
+        region_msg.data = BUMP_REGION_CODE
+        self.region_pub.publish(region_msg)
 
     def enemy_targets_callback(self, msg):
         if not msg.tracking:
@@ -526,12 +524,12 @@ class RegionMonitorNode(Node):
             sent_yaw_deg = float(math.degrees(selected_yaw))
         elif self.start_yaw is not None:
             sent_yaw_deg = float(math.degrees(normalize_angle(selected_yaw - self.start_yaw)))
-        running_state = BUMP_RUNNING_STATE if self.in_bump_zone else 0
+        region_code = BUMP_REGION_CODE if self.in_bump_zone else 0
         now = time.time()
         if now - self.last_mode_log_time >= 0.5:
             self.last_mode_log_time = now
             if self.in_bump_zone:
-                mode_name = '颠簸路段底盘对齐模式'
+                mode_name = '颠簸路段区域模式'
             elif yaw_source == 'omni_udp':
                 mode_name = '全向感知跟踪模式'
             elif yaw_source == 'omni_std':
@@ -596,7 +594,7 @@ class RegionMonitorNode(Node):
                 'None' if sent_yaw_deg is None else describe_turn_direction(sent_yaw_deg)
             )
             self.get_logger().info(
-                f'[控制角] 运行状态={running_state}, 角度来源={yaw_source_str}, '
+                f'[控制角] region={region_code}, 角度来源={yaw_source_str}, '
                 f'启动基准角={start_yaw_str} deg, 当前相对角={current_yaw_str} deg, '
                 f'对齐差值={yaw_delta_str} deg, 下发角度={sent_yaw_str} deg, '
                 f'电控应动作={turn_direction_str}')
