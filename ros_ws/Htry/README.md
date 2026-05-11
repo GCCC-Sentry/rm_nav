@@ -95,7 +95,7 @@ Behavior details:
 - `/region` is now the dedicated bump-zone state topic sent by `region_monitor_node`.
 - `region=0`: not in a bump zone
 - `region=1`: currently in a bump zone
-- In the serial bridge packet, this value is forwarded through the reserved extension slot `ext0`.
+- In the serial bridge packet, this value is forwarded as a dedicated `uint8` field.
 
 ## Root Cause of "Should Move Forward But Actually Moves Backward"
 

@@ -456,6 +456,22 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /pursuit_debug_markers
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: BackUp Free Space
+      Namespaces:
+        direction: true
+        direction_text: true
+        free_points: true
+        planned_backup: true
+        robot: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: back_up_free_space_markers
+      Value: true
     - Alpha: 1
       Buffer Length: 1
       Class: rviz_default_plugins/Path

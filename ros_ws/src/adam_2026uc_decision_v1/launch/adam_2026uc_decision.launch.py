@@ -17,12 +17,12 @@ def generate_launch_description():
                 'hp_supply_threshold': 120,    # HP 低于此值前往补给
                 'hp_full': 400,                # 满血值
                 'supply_timeout_sec': 5.0,     # 补给点最多待 5 秒
-                'patrol_interval_sec': 50.0,   # 巡逻点切换间隔
+                'patrol_interval_sec': 5.0,    # 巡逻点切换间隔
                 'spin_speed': 7.0,             # 小陀螺转速 rad/s
                 'loop_rate_hz': 10.0,          # 主循环频率
                 'stance_hp_threshold': 201,    # HP > 201 为进攻, 否则移动
-                'attack_stance_duration_sec': 5.0,    # 进攻5秒后切到移动
-                'move_stance_duration_sec': 8.0,      # 移动8秒后恢复进攻
+                'attack_stance_duration_sec': 60.0,   # 进攻60秒后切到移动
+                'move_stance_duration_sec': 60.0,     # 移动60秒后恢复进攻
             }],
         ),
     ])

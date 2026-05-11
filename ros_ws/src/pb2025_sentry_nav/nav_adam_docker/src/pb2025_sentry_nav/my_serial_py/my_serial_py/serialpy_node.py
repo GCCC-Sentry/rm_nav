@@ -1417,7 +1417,7 @@ import struct
 import threading
 import time
 import libscrc
-from std_msgs.msg import Int8, Float32, UInt32
+from std_msgs.msg import Int8, Float32, UInt8, UInt32
 from geometry_msgs.msg import Twist
 
 # 导入自定义接口
@@ -1487,10 +1487,12 @@ class SerialNode(Node):
         
         # 【重要：数据顺序修正】
         # 根据 minicom 观察：A5(头) + 04(Type) + 04(Progress) + 64 00(HP=100) ...
-        # 格式：B(Type), B(Progress), H(remain_hp), H(max_hp), H(time), H(bullet), H(outpost), H(base), I(rfid)
-        self.STRUCT_FMT = '<BBHHHHHHI' 
-        self.PAYLOAD_SIZE = struct.calcsize(self.STRUCT_FMT) # 18
-        self.PACKET_SIZE = 1 + self.PAYLOAD_SIZE + 2  # 总计 21 字节
+        # 格式：
+        # B(Type), B(Progress), H(remain_hp), H(max_hp), H(time),
+        # H(bullet), H(outpost), H(base), I(rfid), I(contact_angle), B(is_fire)
+        self.STRUCT_FMT = '<BBHHHHHHIIB'
+        self.PAYLOAD_SIZE = struct.calcsize(self.STRUCT_FMT)
+        self.PACKET_SIZE = 1 + self.PAYLOAD_SIZE + 2
 
         self.serial_conn = None
         self.running = True
@@ -1498,11 +1500,12 @@ class SerialNode(Node):
         self.stance_running_state = 3  # 默认移动姿态 (running_state=3)
         self.region_code = 0          # /region 下发的区域编码，0=普通区域
         self.yaw_angle = 0.0  # 来自 /cmd_yaw_angle 的独立 yaw 角度(单位: deg)
+        self.big_yaw_aligned = 0      # 来自 /big_yaw_aligned 的大yaw对齐标志，0/1
         self.latest_x = 0.0   # 缓存最新 cmd_vel
         self.latest_y = 0.0
-        # 预留给后续 ROS -> STM32 扩展通信的 10 个 float 槽位。
-        # 约定 ext0 承载 region 编码，其余 ext1-ext9 先固定发 1.0。
-        self.tx_reserved_fields = [1.0] * 10
+        # 预留给后续 ROS -> STM32 扩展通信的 8 个 float 槽位。
+        # big_yaw_aligned 现已单独占用一个 uint8 字段，不再复用 float 扩展位。
+        self.tx_reserved_fields = [1.0] * 8
 
         self.create_subscribers()
         self.create_publishers()
@@ -1521,7 +1524,9 @@ class SerialNode(Node):
         self.mode_sub = self.create_subscription(Int8, '/cmd_chassis_mode', self.chassis_mode_callback, 10)
         self.stance_sub = self.create_subscription(UInt32, '/cmd_stance', self.stance_callback, 10)
         self.yaw_angle_sub = self.create_subscription(Float32, '/cmd_yaw_angle', self.yaw_angle_callback, 10)
-        self.region_sub = self.create_subscription(Int8, '/region', self.region_callback, 10)
+        self.region_sub = self.create_subscription(UInt8, '/region', self.region_callback, 10)
+        self.big_yaw_aligned_sub = self.create_subscription(
+            UInt8, '/big_yaw_aligned', self.big_yaw_aligned_callback, 10)
 
     def create_publishers(self):
         # 使用绝对路径发布话题，供行为树使用
@@ -1530,6 +1535,8 @@ class SerialNode(Node):
             'robot_status': self.create_publisher(RobotStatus, '/referee/robot_status', 10),
             'all_robot_hp': self.create_publisher(GameRobotHP, '/referee/all_robot_hp', 10),
             'rfid_status': self.create_publisher(RfidStatus, '/referee/rfid_status', 10),
+            'contact_angle': self.create_publisher(UInt32, '/contact_angle', 10),
+            'is_fire': self.create_publisher(UInt8, '/is_fire', 10),
         }
 
     def try_connect_serial(self):
@@ -1580,9 +1587,10 @@ class SerialNode(Node):
             payload = packet[1:-2]
             res = struct.unpack(self.STRUCT_FMT, payload)
 
-            (game_type, game_progress, remain_hp, max_hp, 
-             stage_remain_time, bullet_17mm, 
-             outpost_hp, base_hp, rfid_status_int) = res
+            (game_type, game_progress, remain_hp, max_hp,
+             stage_remain_time, bullet_17mm,
+             outpost_hp, base_hp, rfid_status_int,
+             contact_angle, is_fire) = res
 
             # --- 发布数据到 ROS 话题 ---
             
@@ -1612,8 +1620,18 @@ class SerialNode(Node):
             rfid_msg.center_gain_point = bool(rfid_status_int & (1 << 3))
             self.pubs['rfid_status'].publish(rfid_msg)
 
+            contact_angle_msg = UInt32()
+            contact_angle_msg.data = int(contact_angle)
+            self.pubs['contact_angle'].publish(contact_angle_msg)
+
+            is_fire_msg = UInt8()
+            is_fire_msg.data = int(is_fire)
+            self.pubs['is_fire'].publish(is_fire_msg)
+
             # 终端日志实时确认数据顺序
-            self.get_logger().info(f"✅ 类型:{game_type} | 进度:{game_progress} | 血量:{remain_hp}")
+            self.get_logger().info(
+                f"✅ 类型:{game_type} | 进度:{game_progress} | 血量:{remain_hp} "
+                f"| yaw差角:{contact_angle} | is_fire:{is_fire}")
             return True
 
         except Exception as e:
@@ -1632,8 +1650,12 @@ class SerialNode(Node):
         self.get_logger().debug(f'[yaw_angle] 收到: {msg.data:.3f}')
 
     def region_callback(self, msg):
-        """接收区域编码并透传给 STM32 扩展字段 ext0。"""
+        """接收区域编码并透传给 STM32 的独立 uint8 字段。"""
         self.region_code = int(msg.data)
+
+    def big_yaw_aligned_callback(self, msg):
+        """接收大yaw是否已对齐标志，并写入扩展发送槽位。"""
+        self.big_yaw_aligned = 1 if int(msg.data) != 0 else 0
 
     def cmd_vel_callback(self, msg):
         """缓存最新的 cmd_vel xy 速度"""
@@ -1660,16 +1682,18 @@ class SerialNode(Node):
             x_val = float(-self.latest_x * 1.0)
             y_val = float(-self.latest_y * 1.0)
             yaw_val = float(self.yaw_angle)
-            self.tx_reserved_fields[0] = float(self.region_code)
-            # 扩展 ROS -> STM32 报文，额外预留 10 个 float 槽位供后续复用。
+            # 扩展 ROS -> STM32 报文: region 和 big_yaw_aligned 都单独走 uint8，
+            # 后面保留 8 个 float 槽位。
             payload = struct.pack(
-                '<BffffB10f',
+                '<BffffBBB8f',
                 header,
                 x_val,
                 y_val,
                 yaw_val,
                 yaw_val,
                 int(running_state),
+                int(self.region_code),
+                int(self.big_yaw_aligned),
                 *self.tx_reserved_fields,
             )
             crc_val = libscrc.modbus(payload)

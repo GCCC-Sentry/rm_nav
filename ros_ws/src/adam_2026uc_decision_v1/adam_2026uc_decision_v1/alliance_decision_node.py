@@ -59,10 +59,10 @@ STANCE_NAMES = {
 # ═══════════════════════════════════════
 PATROL_POINTS = [
     {"name": "巡逻点1", "x": -3.37, "y": -4.41, "yaw": 0.00},
-    {"name": "巡逻点2", "x": 0.47, "y": 0.00, "yaw": 1.57},
+    {"name": "巡逻点2", "x": -2.26, "y": -4.70, "yaw": 1.57},
 ]
 
-SUPPLY_POINT = {"name": "补给点", "x": -0.83, "y": 0.05, "yaw": 0.00}
+SUPPLY_POINT = {"name": "补给点", "x": 0.67, "y": -0.26, "yaw": 0.00}
 
 
 # ═══════════════════════════════════════
@@ -120,8 +120,8 @@ class AllianceDecisionNode(Node):
         self.declare_parameter('spin_speed', 7.0)
         self.declare_parameter('loop_rate_hz', 10.0)
         self.declare_parameter('stance_hp_threshold', 201)
-        self.declare_parameter('attack_stance_duration_sec', 5.0)
-        self.declare_parameter('move_stance_duration_sec', 8.0)
+        self.declare_parameter('attack_stance_duration_sec', 60.0)
+        self.declare_parameter('move_stance_duration_sec', 60.0)
 
         self.HP_SUPPLY_THRESH = self.get_parameter('hp_supply_threshold').value
         self.HP_FULL = self.get_parameter('hp_full').value

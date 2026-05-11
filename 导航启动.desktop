@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=导航启动
+Comment=启动比赛导航脚本
+Exec=/bin/bash -lc "cd /home/asus/nav3_mapping_nogicp_shortLA_stable && ./start_nav_host.sh"
+Icon=utilities-terminal
+Terminal=false
+Categories=Utility;
+StartupNotify=true
