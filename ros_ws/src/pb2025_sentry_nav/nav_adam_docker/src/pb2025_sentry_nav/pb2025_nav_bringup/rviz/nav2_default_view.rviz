@@ -462,6 +462,7 @@ Visualization Manager:
       Namespaces:
         direction: true
         direction_text: true
+        executed_backup: true
         free_points: true
         planned_backup: true
         robot: true

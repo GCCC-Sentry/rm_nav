@@ -85,7 +85,7 @@ protected:
 
   void visualize(
     const nav2_msgs::msg::Costmap & costmap, geometry_msgs::msg::Pose2D pose, float radius,
-    float first_safe_angle, float last_unsafe_angle, float best_angle);
+    float first_safe_angle, float last_unsafe_angle, float best_angle, float relative_angle);
 
   rclcpp::Client<nav2_msgs::srv::GetCostmap>::SharedPtr costmap_client_;
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<visualization_msgs::msg::MarkerArray>>

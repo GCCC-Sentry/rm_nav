@@ -16,10 +16,22 @@
 #include "pb_nav2_plugins/behaviors/back_up_free_space.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <limits>
 
 namespace pb_nav2_behaviors
 {
+
+namespace
+{
+
+float normalizeAngle(float angle)
+{
+  return std::atan2(std::sin(angle), std::cos(angle));
+}
+
+}  // namespace
 
 void BackUpFreeSpace::onConfigure()
 {
@@ -89,10 +101,11 @@ nav2_behaviors::Status BackUpFreeSpace::onRun(
 
   // Find the best direction to back up
   float best_angle = findBestDirection(costmap, pose, -M_PI, M_PI, max_radius_, M_PI / 32.0);
+  const float relative_angle = normalizeAngle(best_angle - pose.theta);
 
-  // Calculate move command
-  twist_x_ = std::cos(best_angle) * command->speed;
-  twist_y_ = std::sin(best_angle) * command->speed;
+  // Convert the selected global direction into robot-frame velocity commands.
+  twist_x_ = std::cos(relative_angle) * command->speed;
+  twist_y_ = std::sin(relative_angle) * command->speed;
   command_x_ = command->target.x;
   command_time_allowance_ = command->time_allowance;
 
@@ -104,7 +117,9 @@ nav2_behaviors::Status BackUpFreeSpace::onRun(
     return nav2_behaviors::Status::FAILED;
   }
   RCLCPP_WARN(
-    logger_, "backing up %f meters towards free space at angle %f", command_x_, best_angle);
+    logger_,
+    "backing up %f meters towards free space at global angle %f (robot relative angle %f)",
+    command_x_, best_angle, relative_angle);
 
   return nav2_behaviors::Status::SUCCEEDED;
 }
@@ -164,13 +179,13 @@ float BackUpFreeSpace::findBestDirection(
   const nav2_msgs::msg::Costmap & costmap, geometry_msgs::msg::Pose2D pose, float start_angle,
   float end_angle, float radius, float angle_increment)
 {
-  float best_angle = start_angle;
-
-  float first_safe_angle = -1.0f;
-  float last_unsafe_angle = -1.0f;
-
-  float final_safe_angle = 0.0f;
-  float final_unsafe_angle = 0.0f;
+  struct AngleCandidate
+  {
+    float angle;
+    float clearance;
+    float support;
+    bool safe;
+  };
 
   float resolution = costmap.metadata.resolution;
   float origin_x = costmap.metadata.origin.position.x;
@@ -182,9 +197,18 @@ float BackUpFreeSpace::findBestDirection(
   float map_max_x = origin_x + (size_x * resolution);
   float map_min_y = origin_y;
   float map_max_y = origin_y + (size_y * resolution);
+  const auto free_points = gatherFreePoints(costmap, pose, radius);
+  const float cone_half_angle = 0.35f;
+
+  std::vector<AngleCandidate> candidates;
+  candidates.reserve(static_cast<size_t>((end_angle - start_angle) / angle_increment) + 1);
+
+  float max_clearance = resolution;
+  float max_support = 0.0f;
 
   for (float angle = start_angle; angle <= end_angle; angle += angle_increment) {
     bool is_safe = true;
+    float clearance = 0.0f;
 
     for (float r = 0; r <= radius; r += resolution) {
       float x = pose.x + r * std::cos(angle);
@@ -198,6 +222,8 @@ float BackUpFreeSpace::findBestDirection(
           if (costmap.data[i + j * size_x] >= 253) {
             is_safe = false;
             break;
+          } else {
+            clearance = r;
           }
         } else {
           is_safe = false;
@@ -208,27 +234,92 @@ float BackUpFreeSpace::findBestDirection(
         break;
       }
     }
-    if (is_safe && first_safe_angle == -1.0f) {
-      first_safe_angle = angle;
+
+    float support = 0.0f;
+    if (is_safe) {
+      for (const auto & point : free_points) {
+        const float dx = point.x - pose.x;
+        const float dy = point.y - pose.y;
+        const float dist = std::hypot(dx, dy);
+        if (dist < resolution || dist > radius) {
+          continue;
+        }
+
+        const float point_angle = std::atan2(dy, dx);
+        const float delta = std::fabs(normalizeAngle(point_angle - angle));
+        if (delta > cone_half_angle) {
+          continue;
+        }
+
+        const float alignment = std::cos(delta);
+        support += (alignment * alignment) /
+          std::max(dist * dist, resolution * resolution);
+      }
     }
 
-    if (!is_safe && first_safe_angle != -1.0f && last_unsafe_angle == -1.0f) {
-      last_unsafe_angle = angle;
-    }
-
-    if (
-      last_unsafe_angle - first_safe_angle > final_unsafe_angle - final_safe_angle &&
-      first_safe_angle != -1.0f && last_unsafe_angle != -1.0f) {
-      final_safe_angle = first_safe_angle;
-      final_unsafe_angle = last_unsafe_angle;
-      first_safe_angle = -1.0f;
-      last_unsafe_angle = -1.0f;
+    candidates.push_back({angle, clearance, support, is_safe});
+    if (is_safe) {
+      max_clearance = std::max(max_clearance, clearance);
+      max_support = std::max(max_support, support);
     }
   }
-  best_angle = (final_safe_angle + final_unsafe_angle) / 2.0f;
+
+  float best_angle = start_angle;
+  float best_score = -1.0f;
+  int best_index = -1;
+
+  for (size_t idx = 0; idx < candidates.size(); ++idx) {
+    const auto & candidate = candidates[idx];
+    if (!candidate.safe) {
+      continue;
+    }
+
+    const float clearance_score = candidate.clearance / std::max(max_clearance, resolution);
+    const float support_score =
+      (max_support > 0.0f) ? (candidate.support / max_support) : 0.0f;
+    const float score = 0.45f * clearance_score + 0.55f * support_score;
+
+    if (score > best_score) {
+      best_score = score;
+      best_angle = candidate.angle;
+      best_index = static_cast<int>(idx);
+    }
+  }
+
+  if (best_index == -1) {
+    if (!free_points.empty()) {
+      float nearest_dist = std::numeric_limits<float>::max();
+      for (const auto & point : free_points) {
+        const float dx = point.x - pose.x;
+        const float dy = point.y - pose.y;
+        const float dist = std::hypot(dx, dy);
+        if (dist < nearest_dist) {
+          nearest_dist = dist;
+          best_angle = std::atan2(dy, dx);
+        }
+      }
+    }
+    best_index = 0;
+  }
+
+  float final_safe_angle = best_angle;
+  float final_unsafe_angle = best_angle;
+  if (!candidates.empty()) {
+    int left = best_index;
+    while (left > 0 && candidates[left - 1].safe) {
+      --left;
+    }
+    int right = best_index;
+    while (right + 1 < static_cast<int>(candidates.size()) && candidates[right + 1].safe) {
+      ++right;
+    }
+    final_safe_angle = candidates[left].angle;
+    final_unsafe_angle = candidates[right].angle;
+  }
 
   if (visualize_) {
-    visualize(costmap, pose, radius, final_safe_angle, final_unsafe_angle, best_angle);
+    const float relative_angle = normalizeAngle(best_angle - pose.theta);
+    visualize(costmap, pose, radius, final_safe_angle, final_unsafe_angle, best_angle, relative_angle);
   }
 
   return best_angle;
@@ -256,7 +347,7 @@ std::vector<geometry_msgs::msg::Point> BackUpFreeSpace::gatherFreePoints(
 
 void BackUpFreeSpace::visualize(
   const nav2_msgs::msg::Costmap & costmap, geometry_msgs::msg::Pose2D pose, float radius,
-  float first_safe_angle, float last_unsafe_angle, float best_angle)
+  float first_safe_angle, float last_unsafe_angle, float best_angle, float relative_angle)
 {
   visualization_msgs::msg::MarkerArray markers;
   const auto stamp = clock_->now();
@@ -364,6 +455,30 @@ void BackUpFreeSpace::visualize(
   path_marker.points.push_back(path_end);
   markers.markers.push_back(path_marker);
 
+  visualization_msgs::msg::Marker exec_marker;
+  exec_marker.header.frame_id = global_frame_;
+  exec_marker.header.stamp = stamp;
+  exec_marker.ns = "executed_backup";
+  exec_marker.id = 4;
+  exec_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+  exec_marker.action = visualization_msgs::msg::Marker::ADD;
+  exec_marker.scale.x = 0.04;
+  exec_marker.color.r = 1.0f;
+  exec_marker.color.g = 0.9f;
+  exec_marker.color.b = 0.1f;
+  exec_marker.color.a = 0.95f;
+  geometry_msgs::msg::Point exec_start;
+  exec_start.x = pose.x;
+  exec_start.y = pose.y;
+  exec_start.z = 0.08;
+  geometry_msgs::msg::Point exec_end;
+  exec_end.x = pose.x + radius * std::cos(pose.theta + relative_angle);
+  exec_end.y = pose.y + radius * std::sin(pose.theta + relative_angle);
+  exec_end.z = 0.08;
+  exec_marker.points.push_back(exec_start);
+  exec_marker.points.push_back(exec_end);
+  markers.markers.push_back(exec_marker);
+
   auto create_arrow = [&](float angle, int id, float r, float g, float b) {
     visualization_msgs::msg::Marker arrow;
     arrow.header.frame_id = global_frame_;
@@ -396,16 +511,17 @@ void BackUpFreeSpace::visualize(
   };
 
   if (last_unsafe_angle > first_safe_angle) {
-    markers.markers.push_back(create_arrow(first_safe_angle, 4, 0.2f, 0.55f, 1.0f));
-    markers.markers.push_back(create_arrow(last_unsafe_angle, 5, 0.2f, 0.55f, 1.0f));
+    markers.markers.push_back(create_arrow(first_safe_angle, 5, 0.2f, 0.55f, 1.0f));
+    markers.markers.push_back(create_arrow(last_unsafe_angle, 6, 0.2f, 0.55f, 1.0f));
   }
-  markers.markers.push_back(create_arrow(best_angle, 6, 1.0f, 0.25f, 0.2f));
+  markers.markers.push_back(create_arrow(best_angle, 7, 1.0f, 0.25f, 0.2f));
+  markers.markers.push_back(create_arrow(pose.theta + relative_angle, 8, 1.0f, 0.9f, 0.1f));
 
   visualization_msgs::msg::Marker text_marker;
   text_marker.header.frame_id = global_frame_;
   text_marker.header.stamp = stamp;
   text_marker.ns = "direction_text";
-  text_marker.id = 7;
+  text_marker.id = 9;
   text_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
   text_marker.action = visualization_msgs::msg::Marker::ADD;
   text_marker.pose.position.x = pose.x;
@@ -419,8 +535,9 @@ void BackUpFreeSpace::visualize(
   text_marker.color.a = 1.0f;
   char label[128];
   std::snprintf(
-    label, sizeof(label), "BackUpFreeSpace\nangle=%.2f rad\nradius=%.2f m\nfree_pts=%zu",
-    best_angle, radius, free_points.size());
+    label, sizeof(label),
+    "BackUpFreeSpace\nglobal=%.2f rad\nrelative=%.2f rad\nradius=%.2f m\nfree_pts=%zu",
+    best_angle, relative_angle, radius, free_points.size());
   text_marker.text = label;
   markers.markers.push_back(text_marker);
 
