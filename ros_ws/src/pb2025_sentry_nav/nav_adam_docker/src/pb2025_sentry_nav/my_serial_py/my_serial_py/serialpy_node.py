@@ -1489,8 +1489,8 @@ class SerialNode(Node):
         # 根据 minicom 观察：A5(头) + 04(Type) + 04(Progress) + 64 00(HP=100) ...
         # 格式：
         # B(Type), B(Progress), H(remain_hp), H(max_hp), H(time),
-        # H(bullet), H(outpost), H(base), I(rfid), I(contact_angle), B(is_fire)
-        self.STRUCT_FMT = '<BBHHHHHHIIB'
+        # H(bullet), H(outpost), H(base), I(rfid), f(contact_angle), B(is_fire)
+        self.STRUCT_FMT = '<BBHHHHHHIfB'
         self.PAYLOAD_SIZE = struct.calcsize(self.STRUCT_FMT)
         self.PACKET_SIZE = 1 + self.PAYLOAD_SIZE + 2
 
@@ -1535,7 +1535,7 @@ class SerialNode(Node):
             'robot_status': self.create_publisher(RobotStatus, '/referee/robot_status', 10),
             'all_robot_hp': self.create_publisher(GameRobotHP, '/referee/all_robot_hp', 10),
             'rfid_status': self.create_publisher(RfidStatus, '/referee/rfid_status', 10),
-            'contact_angle': self.create_publisher(UInt32, '/contact_angle', 10),
+            'contact_angle': self.create_publisher(Float32, '/contact_angle', 10),
             'is_fire': self.create_publisher(UInt8, '/is_fire', 10),
         }
 
@@ -1620,8 +1620,8 @@ class SerialNode(Node):
             rfid_msg.center_gain_point = bool(rfid_status_int & (1 << 3))
             self.pubs['rfid_status'].publish(rfid_msg)
 
-            contact_angle_msg = UInt32()
-            contact_angle_msg.data = int(contact_angle)
+            contact_angle_msg = Float32()
+            contact_angle_msg.data = float(contact_angle)
             self.pubs['contact_angle'].publish(contact_angle_msg)
 
             is_fire_msg = UInt8()
