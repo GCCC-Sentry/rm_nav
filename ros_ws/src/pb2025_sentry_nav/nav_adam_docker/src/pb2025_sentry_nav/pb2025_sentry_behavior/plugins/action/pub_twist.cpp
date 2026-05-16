@@ -4,6 +4,7 @@
 #include "pb2025_sentry_behavior/plugins/action/pub_twist.hpp"
 #include <thread>
 #include <chrono>
+#include "rclcpp/rclcpp.hpp"
 
 namespace pb2025_sentry_behavior
 {
@@ -35,6 +36,14 @@ bool PublishTwistAction::setMessage(geometry_msgs::msg::Twist & msg)
   msg.linear.x = v_x;
   msg.linear.y = v_y;
   msg.angular.z = v_yaw;
+
+  RCLCPP_INFO(
+    node_->get_logger(),
+    "【动作】%s -> 发布 cmd_vel x=%.2f y=%.2f yaw=%.2f",
+    name().c_str(),
+    v_x,
+    v_y,
+    v_yaw);
 
   // 修改点 2: 读取 int 并转换为 milliseconds
   auto duration_ms = getInput<int>("duration");

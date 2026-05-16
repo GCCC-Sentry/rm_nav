@@ -40,6 +40,9 @@ public:
   BT::NodeStatus onFeedback(const std::shared_ptr<const Feedback> feedback) override;
 
   BT::NodeStatus onFailure(BT::ActionNodeErrorCode error) override;
+
+private:
+  std::string current_step_name_;
 };
 }  // namespace pb2025_sentry_behavior
 

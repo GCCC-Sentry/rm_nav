@@ -4,6 +4,7 @@
 #include "pb2025_sentry_behavior/plugins/action/pub_spin_speed.hpp"
 #include <thread> // 必须添加
 #include <chrono> // 必须添加
+#include "rclcpp/rclcpp.hpp"
 
 namespace pb2025_sentry_behavior
 {
@@ -30,6 +31,12 @@ bool PublishSpinSpeedAction::setMessage(example_interfaces::msg::Float32 & msg)
     return false;
   }
   msg.data = static_cast<float>(spin_speed);
+
+  RCLCPP_INFO(
+    node_->get_logger(),
+    "【动作】%s -> 发布 cmd_spin=%.2f rad/s",
+    name().c_str(),
+    spin_speed);
 
   // 修改点 2: 读取 int 并转换为 milliseconds
   auto duration_ms = getInput<int>("duration");

@@ -79,12 +79,17 @@ bool SendNav2GoalAction::setGoal(nav2_msgs::action::NavigateToPose::Goal & goal)
     return false;
   }
 
+  current_step_name_ = name();
+  getInput("step_name", current_step_name_);
+
   std::stringstream ss;
   ss << "\n╔════════════════════════════════════════════════════════╗";
   logBoth(logger(), ss.str());
   
   ss.str("");
-  ss << "║  【巡逻任务 #" << goal_counter << "】前往目标点                        ║";
+  ss << "║  【行为步骤 #" << goal_counter << "】" << current_step_name_;
+  while (ss.str().length() < 56) ss << " ";
+  ss << "║";
   logBoth(logger(), ss.str());
   
   ss.str("");
@@ -122,17 +127,20 @@ BT::NodeStatus SendNav2GoalAction::onResultReceived(const WrappedResult & wr)
   
   switch (wr.code) {
     case rclcpp_action::ResultCode::SUCCEEDED:
-      logBoth(logger(), "║  ✓✓✓ 导航成功！已到达目标点 ✓✓✓                      ║");
+      logBoth(logger(), ("║  ✓✓✓ 步骤成功：" + current_step_name_).c_str());
+      logBoth(logger(), "║  已到达目标点                                        ║");
       logBoth(logger(), "╚════════════════════════════════════════════════════════╝\n");
       return BT::NodeStatus::SUCCESS;
       
     case rclcpp_action::ResultCode::ABORTED:
-      logBoth(logger(), "║  ❌ 导航中止                                          ║", true);
+      logBoth(logger(), ("║  ❌ 步骤失败：" + current_step_name_).c_str(), true);
+      logBoth(logger(), "║  导航中止                                            ║", true);
       logBoth(logger(), "╚════════════════════════════════════════════════════════╝\n", true);
       return BT::NodeStatus::FAILURE;
       
     case rclcpp_action::ResultCode::CANCELED:
-      logBoth(logger(), "║  ⚠ 导航取消                                           ║");
+      logBoth(logger(), ("║  ⚠ 步骤取消：" + current_step_name_).c_str());
+      logBoth(logger(), "║  导航取消                                            ║");
       logBoth(logger(), "╚════════════════════════════════════════════════════════╝\n");
       return BT::NodeStatus::FAILURE;
       
@@ -180,6 +188,9 @@ BT::NodeStatus SendNav2GoalAction::onFeedback(
 
 void SendNav2GoalAction::onHalt() {
     logBoth(logger(), "⚠ SendNav2Goal 被中止 - 正在取消导航目标");
+    if (!current_step_name_.empty()) {
+      logBoth(logger(), "  → 当前中止步骤: " + current_step_name_);
+    }
     // 基类会自动调用cancelGoal()，这里添加日志确认
     logBoth(logger(), "  → 已发送取消请求到Nav2，等待Nav2处理...");
 }
@@ -230,7 +241,8 @@ BT::PortsList SendNav2GoalAction::providedPorts()
   return providedBasicPorts({
     BT::InputPort<double>("x", 0.0, "Goal X"),
     BT::InputPort<double>("y", 0.0, "Goal Y"),
-    BT::InputPort<double>("yaw", 0.0, "Goal Yaw (rad)")
+    BT::InputPort<double>("yaw", 0.0, "Goal Yaw (rad)"),
+    BT::InputPort<std::string>("step_name", "", "Human-readable step name for runtime logs")
   });
 }
 

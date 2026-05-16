@@ -22,6 +22,15 @@
             <input_port name="expected_game_progress" type="int" default="4">Expected game progress stage</input_port>
             <input_port name="key_port" type="pb_rm_interfaces::msg::GameStatus_&lt;std::allocator&lt;void&gt; &gt;" default="{@referee_gameStatus}">GameStatus port on blackboard</input_port>
         </Condition>
+        <Condition ID="IsPoseNear">
+            <input_port name="transform_timeout" type="double" default="0.200000">TF lookup timeout in seconds</input_port>
+            <input_port name="base_frame" type="std::string" default="base_footprint">Robot base frame for TF lookup</input_port>
+            <input_port name="step_name" type="std::string" default="目标点">Readable target name</input_port>
+            <input_port name="target_frame" type="std::string" default="map">Target frame for TF lookup</input_port>
+            <input_port name="tolerance" type="double" default="0.350000">Reach tolerance in meters</input_port>
+            <input_port name="y" type="double" default="0.000000">Target Y coordinate</input_port>
+            <input_port name="x" type="double" default="0.000000">Target X coordinate</input_port>
+        </Condition>
         <Condition ID="IsRfidDetected">
             <input_port name="friendly_supply_zone_exchange" type="bool" default="false">己方与兑换区重叠的补给区</input_port>
             <input_port name="friendly_supply_zone_non_exchange" type="bool" default="false">己方与兑换区不重叠的补给区 / RMUL 补给区</input_port>
@@ -38,6 +47,7 @@
         <Condition ID="PubNav2Goal">
             <input_port name="y" type="double" default="0.000000">Goal Y coordinate</input_port>
             <input_port name="yaw" type="double" default="0.000000">Goal Yaw angle (rad)</input_port>
+            <input_port name="step_name" type="std::string" default="发送导航目标">Readable step name</input_port>
             <input_port name="x" type="double" default="0.000000">Goal X coordinate</input_port>
             <input_port name="topic_name" type="std::string" default="__default__placeholder__">Topic name</input_port>
         </Condition>
@@ -83,6 +93,7 @@
             <input_port name="x" type="double" default="0.000000">Goal X</input_port>
             <input_port name="y" type="double" default="0.000000">Goal Y</input_port>
             <input_port name="yaw" type="double" default="0.000000">Goal Yaw (rad)</input_port>
+            <input_port name="step_name" type="std::string" default="">Human-readable step name for runtime logs</input_port>
             <input_port name="action_name" type="std::string" default="">Action server name</input_port>
         </Action>
         <Decorator ID="TickAfterTimeout">

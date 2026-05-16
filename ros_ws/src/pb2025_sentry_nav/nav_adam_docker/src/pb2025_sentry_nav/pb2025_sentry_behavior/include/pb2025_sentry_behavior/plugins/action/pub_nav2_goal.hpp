@@ -4,15 +4,16 @@
 #ifndef PB2025_SENTRY_BEHAVIOR__PLUGINS__ACTION__PUB_NAV2_GOAL_HPP_
 #define PB2025_SENTRY_BEHAVIOR__PLUGINS__ACTION__PUB_NAV2_GOAL_HPP_
 
+#include <chrono>
 #include <string>
-// 1. 修改引用
+
 #include "behaviortree_ros2/bt_topic_pub_node.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "rclcpp/rclcpp.hpp"
 
 namespace pb2025_sentry_behavior
 {
 
-// 2. 修改基类为 BT::RosTopicPubNode
 class PubNav2Goal : public BT::RosTopicPubNode<geometry_msgs::msg::PoseStamped>
 {
 public:
@@ -23,7 +24,9 @@ public:
 
   bool setMessage(geometry_msgs::msg::PoseStamped & msg) override;
 
-  // 3. 删除 setHaltMessage
+private:
+  rclcpp::Logger logger_ = rclcpp::get_logger("PubNav2Goal");
+  std::chrono::steady_clock::time_point last_print_time_ = std::chrono::steady_clock::now();
 };
 
 }  // namespace pb2025_sentry_behavior

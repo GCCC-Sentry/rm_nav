@@ -14,28 +14,23 @@ from auto_aim_interfaces.msg import Target
 
 # ================= 颠簸区域配置 =================
 # 每个区域包含:
-#   name      : 区域名称 (日志/可视化)
-#   vertices  : 多边形顶点 [(x,y), ...], map坐标系, 按顺序排列
-#   target_yaw: 穿越时 yaw 目标角度 (弧度, map坐标系, 0 = +X方向)
-#   forward_speed: 穿越时强制前进速度 (m/s, 正值=车头方向)
+#   name     : 区域名称 (日志/可视化)
+#   vertices : 多边形顶点 [(x,y), ...], map坐标系, 按顺序排列
+# 具体的去程/回程目标角与速度由监控区域锁定的方向决定。
 BUMP_ZONES = [
     {
         'name': 'bump_zone_1',
         'vertices': [
-                (-4.77, -3.68),
-                (-4.84, 2.94),
-                (3.07, 2.99),
-                (3.38, -3.96),
+                (-3.16, 1.78),
+                (-7.75, 1.68),
+                (-7.48, -0.11),
+                (-2.56, 0.45),
         ],
-        'target_yaw': 0.0,       # yaw=0 即 map +X 方向
-        'forward_speed': 1.0,    # 前进速度 m/s
     },
     # 可继续添加更多颠簸区域:
     # {
     #     'name': 'bump_zone_2',
     #     'vertices': [(5.0, 2.0), (7.0, 2.0), (7.0, 4.0), (5.0, 4.0)],
-    #     'target_yaw': 1.57,   # +Y方向穿越
-    #     'forward_speed': 1.0,
     # },
 ]
 
@@ -45,9 +40,11 @@ BUMP_OVERRIDE_RATE = 50.0
 # 进入颠簸区域时通过 /region 下发给串口节点的区域编号。
 # 0 表示普通区域，5 表示颠簸区域。
 BUMP_REGION_CODE = 5
-BUMP_ALIGN_TOLERANCE_DEG = 3.0
-BUMP_HOLD_SECONDS = 10.0
-BUMP_DRIVE_SPEED = -1.5
+BUMP_ALIGN_DELAY_SECONDS = 3.0
+BUMP_ALIGN_TOLERANCE_DEG = 8.0
+BUMP_HOLD_SECONDS = 8.0
+BUMP_FORWARD_SPEED = -3.8
+BUMP_BACKWARD_SPEED = -3.8
 # ================================================
 
 
@@ -82,15 +79,25 @@ class RegionMonitorNode(Node):
         # ================= 普通监控区域 (保留原有功能) =================
         self.regions = [
             {
-                'name': 'patrol_zone_1',
+                'name': 'direction_zone_forward',
                 'vertices': [
-                    (-5.77, -3.68),
-                    (-5.84, -6.06),
-                    (1.07, -6.00),
-                    (1.38, -3.96),
-                ]
+                    (-3.19, 1.24),
+                    (-4.94, 1.36),
+                    (-4.87, 0.16),
+                    (-3.14, 0.36),
+                ],
+                'direction_code': 1,
             },
-            # 您可以添加更多普通监控区域...
+            {
+                'name': 'direction_zone_backward',
+                'vertices': [
+                    (-6.90, 1.28),
+                    (-7.53, 1.70),
+                    (-7.80, 0.40),
+                    (-5.50, 1.86),
+                ],
+                'direction_code': 2,
+            },
         ]
         # ===================================================================
 
@@ -123,8 +130,10 @@ class RegionMonitorNode(Node):
         self.pose_valid = False
         self.last_yaw_log_time = 0.0
         self.bump_phase = 'idle'
+        self.bump_align_delay_start_time = None
         self.bump_hold_start_time = None
         self.big_yaw_aligned = False
+        self.travel_direction = 1
 
         # 定时器: 10Hz 检查区域 + 发布可视化
         self.timer = self.create_timer(0.1, self.timer_callback)
@@ -169,6 +178,7 @@ class RegionMonitorNode(Node):
 
             # 2. 检查普通监控区域 + 发布可视化
             in_any_region = False
+            matched_direction_code = None
             marker_array = MarkerArray()
             timestamp = self.get_clock().now().to_msg()
 
@@ -177,13 +187,23 @@ class RegionMonitorNode(Node):
                 is_inside_this = self.point_in_polygon(current_x, current_y, verts)
                 if is_inside_this:
                     in_any_region = True
+                    matched_direction_code = int(region.get('direction_code', 0))
 
                 # 构建可视化 Marker (普通区域: 绿/红)
+                if int(region.get('direction_code', 0)) == 1:
+                    color_out = (0.0, 1.0, 0.0)   # 去程区未激活: 绿
+                    color_in = (1.0, 1.0, 0.0)    # 去程区激活: 黄
+                elif int(region.get('direction_code', 0)) == 2:
+                    color_out = (0.6, 0.2, 1.0)   # 回程区未激活: 紫
+                    color_in = (1.0, 0.0, 1.0)    # 回程区激活: 品红
+                else:
+                    color_out = (0.0, 1.0, 0.0)
+                    color_in = (1.0, 0.0, 0.0)
                 marker = self._make_polygon_marker(
                     i, "monitor_regions", verts, timestamp,
                     inside=is_inside_this,
-                    color_in=(1.0, 0.0, 0.0),    # 红
-                    color_out=(0.0, 1.0, 0.0))    # 绿
+                    color_in=color_in,
+                    color_out=color_out)
                 marker_array.markers.append(marker)
 
             # 3. 检查颠簸区域 + 发布可视化
@@ -211,10 +231,13 @@ class RegionMonitorNode(Node):
 
             # 4. 普通区域日志
             if in_any_region and not self.in_region_prev:
-                self.get_logger().warn('>>> 进入监控区域')
+                self.get_logger().warn(
+                    f'>>> 进入监控区域，锁定方向={self._describe_direction_code(matched_direction_code)}')
             elif not in_any_region and self.in_region_prev:
                 self.get_logger().info('<<< 离开监控区域')
             self.in_region_prev = in_any_region
+            if matched_direction_code in (1, 2):
+                self.travel_direction = matched_direction_code
 
             # 5. 颠簸区域进入/离开处理
             if self.in_bump_zone and not prev_in_bump:
@@ -233,11 +256,16 @@ class RegionMonitorNode(Node):
 
         self.get_logger().warn(
             f'>>> 进入颠簸区域 [{zone["name"]}]! '
+            f'当前方向={self._describe_direction_code(self.travel_direction)}, '
             f'下发 region={BUMP_REGION_CODE}, '
-            f'yaw 接近 0° 持续 {BUMP_HOLD_SECONDS:.1f}s 后, 再以 {BUMP_DRIVE_SPEED:.1f}m/s 前进, '
-            f'启动基准角=0.0°')
-        self.bump_phase = 'aligning'
+            f'先等待 {BUMP_ALIGN_DELAY_SECONDS:.1f}s, '
+            f'yaw 对齐到 {math.degrees(self._get_bump_target_yaw()):.1f}° 持续 {BUMP_HOLD_SECONDS:.1f}s 后, '
+            f'再以 {self._get_bump_drive_speed():.1f}m/s 穿越')
+        self.bump_phase = 'delay_before_align'
+        self.bump_align_delay_start_time = time.time()
         self.bump_hold_start_time = None
+        self.big_yaw_aligned = False
+        self._publish_big_yaw_aligned()
 
         region_msg = UInt8()
         region_msg.data = BUMP_REGION_CODE
@@ -252,6 +280,7 @@ class RegionMonitorNode(Node):
         """离开颠簸区域: 停止覆盖, 恢复底盘模式"""
         self.get_logger().info('<<< 离开颠簸区域, 恢复正常控制')
         self.bump_phase = 'idle'
+        self.bump_align_delay_start_time = None
         self.bump_hold_start_time = None
         self.big_yaw_aligned = False
         self._publish_big_yaw_aligned()
@@ -277,29 +306,41 @@ class RegionMonitorNode(Node):
 
         self._update_big_yaw_aligned()
 
-        current_yaw_deg = 0.0
-        if self.start_yaw is not None and self.current_yaw_unwrapped is not None:
-            current_yaw_deg = math.degrees(self.current_yaw_unwrapped - self.start_yaw)
+        current_yaw_deg = self._get_bump_target_error_deg()
+
+        if self.bump_phase == 'delay_before_align':
+            if (self.bump_align_delay_start_time is not None and
+                    time.time() - self.bump_align_delay_start_time >= BUMP_ALIGN_DELAY_SECONDS):
+                self.bump_phase = 'aligning'
+                self.bump_hold_start_time = None
+                self.get_logger().info(
+                    f'[颠簸区] 延迟 {BUMP_ALIGN_DELAY_SECONDS:.1f}s 结束，'
+                    f'开始按{self._describe_direction_code(self.travel_direction)}对齐到底盘目标角')
 
         if self.bump_phase == 'aligning':
             if abs(current_yaw_deg) <= BUMP_ALIGN_TOLERANCE_DEG:
                 if self.bump_hold_start_time is None:
                     self.bump_hold_start_time = time.time()
                     self.get_logger().info(
-                        f'[BUMP] yaw 已接近 0° ({current_yaw_deg:.1f}°), 开始连续计时 {BUMP_HOLD_SECONDS:.1f}s')
+                        f'[颠簸区] 当前已接近目标角，'
+                        f'方向={self._describe_direction_code(self.travel_direction)}，'
+                        f'角度误差={current_yaw_deg:.1f}°，'
+                        f'开始连续计时 {BUMP_HOLD_SECONDS:.1f}s')
                 elif time.time() - self.bump_hold_start_time >= BUMP_HOLD_SECONDS:
                     self.bump_phase = 'driving'
                     self.get_logger().info(
-                        f'[BUMP] yaw 连续稳定 {BUMP_HOLD_SECONDS:.1f}s，开始直行，速度 {BUMP_DRIVE_SPEED:.1f}m/s')
+                        f'[颠簸区] 目标角连续稳定 {BUMP_HOLD_SECONDS:.1f}s，'
+                        f'开始按{self._describe_direction_code(self.travel_direction)}通过，'
+                        f'速度 {self._get_bump_drive_speed():.1f}m/s')
             else:
                 if self.bump_hold_start_time is not None:
                     self.get_logger().info(
-                        f'[BUMP] yaw 偏离 0° ({current_yaw_deg:.1f}°), 连续计时清零')
+                        f'[颠簸区] 目标角误差变大 ({current_yaw_deg:.1f}°)，连续计时清零')
                 self.bump_hold_start_time = None
 
         if self.bump_phase == 'driving':
             twist = Twist()
-            twist.linear.x = BUMP_DRIVE_SPEED
+            twist.linear.x = self._get_bump_drive_speed()
             twist.linear.y = 0.0
             twist.angular.z = 0.0
             self.cmd_vel_pub.publish(twist)
@@ -311,11 +352,50 @@ class RegionMonitorNode(Node):
         region_msg.data = BUMP_REGION_CODE
         self.region_pub.publish(region_msg)
 
+    def _get_current_relative_yaw_rad(self):
+        """返回相对启动基准角的归一化 yaw，范围 [-pi, pi]。"""
+        if self.start_yaw is None or self.current_yaw_unwrapped is None:
+            return None
+        return float(normalize_angle(self.current_yaw_unwrapped - self.start_yaw))
+
+    def _get_current_relative_yaw_deg(self):
+        """返回相对启动基准角的归一化 yaw，单位 deg。"""
+        relative_yaw_rad = self._get_current_relative_yaw_rad()
+        if relative_yaw_rad is None:
+            return 0.0
+        return float(math.degrees(relative_yaw_rad))
+
+    def _get_bump_target_yaw(self):
+        """根据当前锁定方向返回颠簸区目标朝向。"""
+        if self.travel_direction == 2:
+            return math.radians(180.0)
+        return math.radians(0.0)
+
+    def _get_bump_drive_speed(self):
+        """根据当前锁定方向返回颠簸区直行速度。"""
+        if self.travel_direction == 2:
+            return BUMP_BACKWARD_SPEED
+        return BUMP_FORWARD_SPEED
+
+    def _get_bump_target_error_deg(self):
+        """返回当前车头与颠簸区目标朝向的误差，单位 deg。"""
+        return float(math.degrees(
+            normalize_angle(self._get_bump_target_yaw() - self.current_yaw)
+        ))
+
+    @staticmethod
+    def _describe_direction_code(direction_code):
+        if direction_code == 2:
+            return '回程'
+        if direction_code == 1:
+            return '去程'
+        return '未锁定'
+
     def _update_big_yaw_aligned(self):
         """根据当前大 yaw 相对启动基准角的误差，更新并发布是否已对齐。"""
         aligned = False
-        if self.in_bump_zone and self.start_yaw is not None and self.current_yaw_unwrapped is not None:
-            current_yaw_deg = math.degrees(self.current_yaw_unwrapped - self.start_yaw)
+        if self.in_bump_zone and self.bump_phase in ('aligning', 'driving'):
+            current_yaw_deg = self._get_bump_target_error_deg()
             aligned = abs(current_yaw_deg) <= BUMP_ALIGN_TOLERANCE_DEG
 
         if aligned != self.big_yaw_aligned:
@@ -340,9 +420,9 @@ class RegionMonitorNode(Node):
     def _publish_selected_yaw(self):
         if self.in_bump_zone:
             selected_yaw = self.latest_nav_yaw
-            if selected_yaw is None and self.active_bump_zone is not None:
-                selected_yaw = float(self.active_bump_zone['target_yaw'])
-            yaw_source = '颠簸区导航目标角'
+            if selected_yaw is None:
+                selected_yaw = self._get_bump_target_yaw()
+            yaw_source = f'颠簸区{self._describe_direction_code(self.travel_direction)}目标角'
         else:
             selected_yaw = self.latest_enemy_yaw
             yaw_source = '自瞄目标角'
@@ -358,12 +438,17 @@ class RegionMonitorNode(Node):
         current_yaw_relative = None
         sent_yaw_deg = None
         yaw_delta = None
-        if self.start_yaw is not None and self.current_yaw_unwrapped is not None:
-            current_yaw_relative = float(self.current_yaw_unwrapped - self.start_yaw)
-            yaw_delta = float(-current_yaw_relative)
+        current_relative_yaw_rad = self._get_current_relative_yaw_rad()
+        if current_relative_yaw_rad is not None:
+            current_yaw_relative = current_relative_yaw_rad
         if self.in_bump_zone:
-            if yaw_delta is not None:
+            yaw_delta = math.radians(self._get_bump_target_error_deg())
+            if self.bump_phase == 'delay_before_align':
+                sent_yaw_deg = 0.0
+            elif yaw_delta is not None:
                 sent_yaw_deg = float(math.degrees(normalize_angle(yaw_delta)))
+        elif current_relative_yaw_rad is not None:
+            yaw_delta = float(-current_relative_yaw_rad)
         elif self.start_yaw is not None:
             sent_yaw_deg = float(math.degrees(normalize_angle(selected_yaw - self.start_yaw)))
         region_code = BUMP_REGION_CODE if self.in_bump_zone else 0
@@ -379,7 +464,8 @@ class RegionMonitorNode(Node):
             sent_yaw_str = 'None' if sent_yaw_deg is None else f'{sent_yaw_deg:.1f}'
             self.get_logger().info(
                 f'[区域控制] 当前区域码={region_code}，'
-                f'当前阶段={"颠簸区对齐/通过" if self.in_bump_zone else "普通区域"}，'
+                f'当前阶段={self.bump_phase if self.in_bump_zone else "normal"}，'
+                f'当前方向={self._describe_direction_code(self.travel_direction)}，'
                 f'角度来源={yaw_source}，'
                 f'启动基准角={start_yaw_str}度，'
                 f'当前相对车头角={current_yaw_str}度，'

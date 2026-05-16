@@ -29,8 +29,8 @@
 
   <BehaviorTree ID="wait_for_respawn">
     <Sequence>
-      <PublishSpinSpeed spin_speed="0.0" duration="0" topic_name="cmd_spin"/>
-      <PublishTwist v_x="0.0" v_y="0.0" v_yaw="0.0" duration="0" topic_name="cmd_vel"/>
+      <PublishSpinSpeed name="StopSpinForRespawn" spin_speed="0.0" duration="0" topic_name="cmd_spin"/>
+      <PublishTwist name="StopChassisForRespawn" v_x="0.0" v_y="0.0" v_yaw="0.0" duration="0" topic_name="cmd_vel"/>
       <RetryUntilSuccessful num_attempts="-1">
         <Sequence>
           <Sleep msec="1000"/>
@@ -45,10 +45,10 @@
 
   <BehaviorTree ID="supply_recovery">
     <Sequence>
-      <PublishSpinSpeed spin_speed="0.0" duration="0" topic_name="cmd_spin"/>
+      <PublishSpinSpeed name="StopSpinForSupply" spin_speed="0.0" duration="0" topic_name="cmd_spin"/>
       <Sleep msec="800"/>
       <RetryUntilSuccessful num_attempts="3">
-        <SendNav2Goal x="2.8" y="0.13" yaw="0.0" action_name="navigate_to_pose"/>
+        <SendNav2Goal x="0.90" y="0.03" yaw="0.0" action_name="navigate_to_pose" step_name="回补给区"/>
       </RetryUntilSuccessful>
 
       <!-- 先确认确实占到了补给区, 死亡后这里用于解除“虚弱” -->
@@ -78,7 +78,7 @@
         <AlwaysSuccess/>
       </Fallback>
 
-      <PublishSpinSpeed spin_speed="7.0" duration="0" topic_name="cmd_spin"/>
+      <PublishSpinSpeed name="ResumeSpinAfterSupply" spin_speed="7.0" duration="0" topic_name="cmd_spin"/>
     </Sequence>
   </BehaviorTree>
 
@@ -92,16 +92,30 @@
 
   <BehaviorTree ID="route_to_center_battlefield">
     <Sequence>
-      <!-- 阶段 1: 先走到颠簸区前集结点 -->
-      <RetryUntilSuccessful num_attempts="3">
-        <SendNav2Goal x="-2.5" y="-4.9" yaw="0.0" action_name="navigate_to_pose"/>
+      <!-- 阶段 1: 持续发 goal_pose, 直到裁判系统位置显示已到集结点 -->
+      <RetryUntilSuccessful num_attempts="-1">
+        <Fallback>
+          <IsPoseNear x="-4.68" y="-0.11" tolerance="0.35" target_frame="map" base_frame="base_footprint" transform_timeout="0.2" step_name="颠簸区前集结点"/>
+          <Sequence>
+            <PubNav2Goal x="-4.68" y="-0.11" yaw="0.0" topic_name="goal_pose" step_name="前往颠簸区前集结点"/>
+            <Sleep msec="1000"/>
+            <AlwaysFailure/>
+          </Sequence>
+        </Fallback>
       </RetryUntilSuccessful>
 
       <Sleep msec="500"/>
 
-      <!-- 阶段 2: 发穿越后的中心战场目标, 进入颠簸区后由 region_monitor 接管底盘对齐 -->
-      <RetryUntilSuccessful num_attempts="3">
-        <SendNav2Goal x="3.8" y="0.0" yaw="0.0" action_name="navigate_to_pose"/>
+      <!-- 阶段 2: 持续发中心目标, 颠簸区内由 region_monitor 接管底盘 -->
+      <RetryUntilSuccessful num_attempts="-1">
+        <Fallback>
+          <IsPoseNear x="-2.25" y="-4.81" tolerance="0.40" target_frame="map" base_frame="base_footprint" transform_timeout="0.2" step_name="中心战场"/>
+          <Sequence>
+            <PubNav2Goal x="-2.25" y="-4.81" yaw="0.0" topic_name="goal_pose" step_name="前往中心战场"/>
+            <Sleep msec="1000"/>
+            <AlwaysFailure/>
+          </Sequence>
+        </Fallback>
       </RetryUntilSuccessful>
 
       <!-- 到达中心后持续驻留, 直到上层因血量/弹丸/死亡打断 -->
@@ -118,7 +132,7 @@
     <RetryUntilSuccessful num_attempts="-1">
       <Sequence>
         <SubTree ID="wait_for_game_start"/>
-        <PublishSpinSpeed spin_speed="7.0" duration="0" topic_name="cmd_spin"/>
+        <PublishSpinSpeed name="StartMainSpin" spin_speed="7.0" duration="0" topic_name="cmd_spin"/>
 
         <!-- 优先级:
              1. 死亡 -> 等复活 -> 回补给区解除虚弱/解锁发射机构

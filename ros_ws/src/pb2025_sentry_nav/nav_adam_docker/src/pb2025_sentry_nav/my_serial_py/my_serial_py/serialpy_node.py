@@ -1489,8 +1489,9 @@ class SerialNode(Node):
         # 根据 minicom 观察：A5(头) + 04(Type) + 04(Progress) + 64 00(HP=100) ...
         # 格式：
         # B(Type), B(Progress), H(remain_hp), H(max_hp), H(time),
-        # H(bullet), H(outpost), H(base), I(rfid), f(contact_angle), B(is_fire)
-        self.STRUCT_FMT = '<BBHHHHHHIfB'
+        # H(bullet), H(outpost), H(base), I(rfid),
+        # f(contact_angle), B(is_fire), f(pnp_distance)
+        self.STRUCT_FMT = '<BBHHHHHHIfBf'
         self.PAYLOAD_SIZE = struct.calcsize(self.STRUCT_FMT)
         self.PACKET_SIZE = 1 + self.PAYLOAD_SIZE + 2
 
@@ -1537,6 +1538,7 @@ class SerialNode(Node):
             'rfid_status': self.create_publisher(RfidStatus, '/referee/rfid_status', 10),
             'contact_angle': self.create_publisher(Float32, '/contact_angle', 10),
             'is_fire': self.create_publisher(UInt8, '/is_fire', 10),
+            'pnp_distance': self.create_publisher(Float32, '/pnp_distance', 10),
         }
 
     def try_connect_serial(self):
@@ -1590,7 +1592,7 @@ class SerialNode(Node):
             (game_type, game_progress, remain_hp, max_hp,
              stage_remain_time, bullet_17mm,
              outpost_hp, base_hp, rfid_status_int,
-             contact_angle, is_fire) = res
+             contact_angle, is_fire, pnp_distance) = res
 
             # --- 发布数据到 ROS 话题 ---
             
@@ -1628,10 +1630,14 @@ class SerialNode(Node):
             is_fire_msg.data = int(is_fire)
             self.pubs['is_fire'].publish(is_fire_msg)
 
+            pnp_distance_msg = Float32()
+            pnp_distance_msg.data = float(pnp_distance)
+            self.pubs['pnp_distance'].publish(pnp_distance_msg)
+
             # 终端日志实时确认数据顺序
             self.get_logger().info(
                 f"✅ 类型:{game_type} | 进度:{game_progress} | 血量:{remain_hp} "
-                f"| yaw差角:{contact_angle} | is_fire:{is_fire}")
+                f"| yaw差角:{contact_angle} | is_fire:{is_fire} | pnp距离:{pnp_distance:.3f}")
             return True
 
         except Exception as e:
