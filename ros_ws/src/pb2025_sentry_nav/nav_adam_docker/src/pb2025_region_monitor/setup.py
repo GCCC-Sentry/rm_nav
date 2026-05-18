@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'region_monitor_node = pb2025_region_monitor.region_monitor_node:main',
+            'region_editor_node = pb2025_region_monitor.region_editor_node:main',
         ],
     },
 )

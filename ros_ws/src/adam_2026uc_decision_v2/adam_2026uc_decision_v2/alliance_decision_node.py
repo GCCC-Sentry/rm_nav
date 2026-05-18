@@ -45,12 +45,12 @@ class State:
 
 class Stance:
     MOVE = 3
-    ATTACK = 1
+    DEFEND = 2
 
 
 STANCE_NAMES = {
     Stance.MOVE: "移动姿态",
-    Stance.ATTACK: "进攻姿态",
+    Stance.DEFEND: "防御姿态",
 }
 
 
@@ -58,11 +58,11 @@ STANCE_NAMES = {
 #  坐标点 (来自 rmul_2026_patrol.xml)
 # ═══════════════════════════════════════
 PATROL_POINTS = [
-    {"name": "巡逻点1", "x": -3.37, "y": -4.41, "yaw": 0.00},
-    {"name": "巡逻点2", "x": -2.26, "y": -4.70, "yaw": 1.57},
+    {"name": "巡逻点1", "x": 4.27, "y": -2.89, "yaw": 0.00},
+    {"name": "巡逻点2", "x": 4.39, "y": -1.54, "yaw": 1.57},
 ]
 
-SUPPLY_POINT = {"name": "补给点", "x": 0.67, "y": -0.26, "yaw": 0.00}
+SUPPLY_POINT = {"name": "补给点", "x": -1.07, "y": -5.22, "yaw": 0.00}
 
 
 # ═══════════════════════════════════════
@@ -113,15 +113,14 @@ class AllianceDecisionNode(Node):
         super().__init__('alliance_decision_node')
 
         # ---- 参数 ----
-        self.declare_parameter('hp_supply_threshold', 120)
+        self.declare_parameter('hp_supply_threshold', 201)
         self.declare_parameter('ammo_supply_threshold', 20)
         self.declare_parameter('hp_full', 400)
         self.declare_parameter('supply_timeout_sec', 5.0)
         self.declare_parameter('patrol_interval_sec', 5.0)
         self.declare_parameter('spin_speed', 7.0)
         self.declare_parameter('loop_rate_hz', 10.0)
-        self.declare_parameter('stance_hp_threshold', 201)
-        self.declare_parameter('attack_stance_duration_sec', 60.0)
+        self.declare_parameter('defend_stance_duration_sec', 60.0)
         self.declare_parameter('move_stance_duration_sec', 60.0)
 
         self.HP_SUPPLY_THRESH = self.get_parameter('hp_supply_threshold').value
@@ -131,8 +130,7 @@ class AllianceDecisionNode(Node):
         self.PATROL_INTERVAL = self.get_parameter('patrol_interval_sec').value
         self.SPIN_SPEED = self.get_parameter('spin_speed').value
         loop_hz = self.get_parameter('loop_rate_hz').value
-        self.STANCE_HP_THRESH = self.get_parameter('stance_hp_threshold').value
-        self.ATTACK_STANCE_DURATION = self.get_parameter('attack_stance_duration_sec').value
+        self.DEFEND_STANCE_DURATION = self.get_parameter('defend_stance_duration_sec').value
         self.MOVE_STANCE_DURATION = self.get_parameter('move_stance_duration_sec').value
 
         # ---- 状态 ----
@@ -148,8 +146,8 @@ class AllianceDecisionNode(Node):
         self.spin_started = False            # 是否已开启小陀螺
         self.last_goal_sent = None           # 上一次发送的目标描述
         self.current_stance = None           # 当前已发布的姿态 ID
-        self.attack_stance_start_time = None # 本轮进攻姿态开始计时
-        self.move_stance_start_time = None   # 临时移动姿态开始计时
+        self.defend_stance_start_time = None # 本轮防御姿态开始计时
+        self.move_stance_start_time = None   # 本轮移动姿态开始计时
         self.last_stance_reason = "未初始化"  # 当前姿态原因
 
         # ---- 数据缓存 ----
@@ -209,14 +207,18 @@ class AllianceDecisionNode(Node):
         """等待 game_progress == 4 (RUNNING)"""
         if self.game_status is not None and self.game_status.game_progress == 4:
             self._log_info("比赛开始! game_progress=4")
-            self.state = State.PATROL
             self.last_patrol_switch_time = self.get_clock().now()
             self.patrol_index = 0
             # 启动小陀螺
             self._publish_spin(self.SPIN_SPEED)
             self.spin_started = True
-            # 立即发送第一个巡逻点
-            self._send_goal(PATROL_POINTS[0])
+            if self._need_supply() or self._need_ammo_supply():
+                self.state = State.SUPPLY
+                self.supply_goal_sent = False
+                self._send_goal(SUPPLY_POINT)
+            else:
+                self.state = State.PATROL
+                self._send_goal(PATROL_POINTS[0])
             return
 
         # 每 2 秒打印一次等待
@@ -328,10 +330,11 @@ class AllianceDecisionNode(Node):
             ammo_text = "未知" if ammo is None else str(ammo)
             self._log_warn(
                 f"⚠ 进入补给: HP={hp}, Ammo={ammo_text}"
-                f" | 阈值 HP<{self.HP_SUPPLY_THRESH} 或 Ammo<{self.AMMO_SUPPLY_THRESH}"
+                f" | 阈值 HP<={self.HP_SUPPLY_THRESH} 或 Ammo<{self.AMMO_SUPPLY_THRESH}"
             )
             self.state = State.SUPPLY
             self.supply_goal_sent = False
+            self._send_goal(SUPPLY_POINT)
             return
 
         # ③ 检查是否该切换巡逻点
@@ -370,7 +373,7 @@ class AllianceDecisionNode(Node):
     def _need_supply(self) -> bool:
         if self.robot_status is None:
             return False
-        return self.robot_status.current_hp < self.HP_SUPPLY_THRESH
+        return self.robot_status.current_hp <= self.HP_SUPPLY_THRESH
 
     def _get_ammo_count(self):
         if self.robot_status is None:
@@ -447,49 +450,52 @@ class AllianceDecisionNode(Node):
         self.pub_spin.publish(msg)
 
     def _update_stance(self):
-        """根据 HP 和进攻姿态累计时间发布 /cmd_stance。"""
+        """在防御姿态和移动姿态之间周期切换。"""
         if self.robot_status is None or self._is_dead():
+            self.defend_stance_start_time = None
+            self.move_stance_start_time = None
             self._set_stance(Stance.MOVE, "无有效血量或阵亡")
             self._log_current_stance()
             return
 
-        hp = self.robot_status.current_hp
         now = self.get_clock().now()
 
-        if hp <= self.STANCE_HP_THRESH:
-            self.attack_stance_start_time = None
+        if self.current_stance is None:
+            self.defend_stance_start_time = now
             self.move_stance_start_time = None
-            self._set_stance(Stance.MOVE, f"HP={hp} <= {self.STANCE_HP_THRESH}")
+            self._set_stance(Stance.DEFEND, "初始化进入防御姿态")
             self._log_current_stance()
             return
 
-        if self.move_stance_start_time is not None:
+        if self.current_stance == Stance.DEFEND:
+            if self.defend_stance_start_time is None:
+                self.defend_stance_start_time = now
+            defend_elapsed = (now - self.defend_stance_start_time).nanoseconds / 1e9
+            if defend_elapsed >= self.DEFEND_STANCE_DURATION:
+                self.defend_stance_start_time = None
+                self.move_stance_start_time = now
+                self._set_stance(Stance.MOVE, f"防御姿态已持续 {defend_elapsed:.1f}s")
+            else:
+                self._set_stance(Stance.DEFEND, f"防御姿态计时 {defend_elapsed:.1f}s", log_change=False)
+            self._log_current_stance()
+            return
+
+        if self.current_stance == Stance.MOVE:
+            if self.move_stance_start_time is None:
+                self.move_stance_start_time = now
             move_elapsed = (now - self.move_stance_start_time).nanoseconds / 1e9
-            if move_elapsed < self.MOVE_STANCE_DURATION:
-                self._set_stance(Stance.MOVE, f"进攻姿态切换保护 {move_elapsed:.1f}s")
-                self._log_current_stance()
-                return
-
-            self.move_stance_start_time = None
-            self.attack_stance_start_time = now
-            self._set_stance(Stance.ATTACK, "临时移动结束")
+            if move_elapsed >= self.MOVE_STANCE_DURATION:
+                self.move_stance_start_time = None
+                self.defend_stance_start_time = now
+                self._set_stance(Stance.DEFEND, f"移动姿态已持续 {move_elapsed:.1f}s")
+            else:
+                self._set_stance(Stance.MOVE, f"移动姿态计时 {move_elapsed:.1f}s", log_change=False)
             self._log_current_stance()
             return
 
-        if self.attack_stance_start_time is None or self.current_stance != Stance.ATTACK:
-            self.attack_stance_start_time = now
-            self._set_stance(Stance.ATTACK, f"HP={hp} > {self.STANCE_HP_THRESH}")
-            self._log_current_stance()
-            return
-
-        attack_elapsed = (now - self.attack_stance_start_time).nanoseconds / 1e9
-        if attack_elapsed >= self.ATTACK_STANCE_DURATION:
-            self.move_stance_start_time = now
-            self._set_stance(Stance.MOVE, f"进攻姿态已持续 {attack_elapsed:.1f}s")
-            self._log_current_stance()
-            return
-
-        self._set_stance(Stance.ATTACK, f"HP={hp} > {self.STANCE_HP_THRESH}", log_change=False)
+        self.defend_stance_start_time = now
+        self.move_stance_start_time = None
+        self._set_stance(Stance.DEFEND, "未知姿态恢复为防御姿态")
         self._log_current_stance()
 
     def _set_stance(self, stance: int, reason: str, log_change: bool = True):
@@ -551,13 +557,12 @@ class AllianceDecisionNode(Node):
             box_line(f"巡逻点2: ({PATROL_POINTS[1]['x']}, {PATROL_POINTS[1]['y']})"),
             box_line(f"补给点 : ({SUPPLY_POINT['x']}, {SUPPLY_POINT['y']})"),
             box_line(""),
-            box_line(f"回血阈值: HP < {self.HP_SUPPLY_THRESH}"),
+            box_line(f"回血阈值: HP <= {self.HP_SUPPLY_THRESH}"),
             box_line(f"补弹阈值: Ammo < {self.AMMO_SUPPLY_THRESH}"),
             box_line(f"巡逻间隔: {self.PATROL_INTERVAL}s"),
             box_line(f"补给超时: {self.SUPPLY_TIMEOUT}s"),
             box_line(f"陀螺转速: {self.SPIN_SPEED} rad/s"),
-            box_line(f"姿态阈值: HP > {self.STANCE_HP_THRESH} 进攻, 否则移动"),
-            box_line(f"姿态切换周期: 进攻 {self.ATTACK_STANCE_DURATION}s, 移动 {self.MOVE_STANCE_DURATION}s"),
+            box_line(f"姿态切换周期: 防御 {self.DEFEND_STANCE_DURATION}s, 移动 {self.MOVE_STANCE_DURATION}s"),
             box_line(""),
             box_line("话题订阅: referee/game_status, referee/robot_status"),
             box_line("话题发布: goal_pose, cmd_spin, cmd_vel, /cmd_stance"),

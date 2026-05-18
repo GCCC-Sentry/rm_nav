@@ -1,10 +1,13 @@
+import json
 import rclpy
 import math
 import time
+from copy import deepcopy
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from geometry_msgs.msg import Point, PoseStamped, Twist
-from std_msgs.msg import Float32, UInt8
+from std_msgs.msg import Float32, String, UInt8
 from visualization_msgs.msg import Marker, MarkerArray
 from tf2_ros import TransformException
 from tf2_ros.buffer import Buffer
@@ -17,7 +20,7 @@ from auto_aim_interfaces.msg import Target
 #   name     : 区域名称 (日志/可视化)
 #   vertices : 多边形顶点 [(x,y), ...], map坐标系, 按顺序排列
 # 具体的去程/回程目标角与速度由监控区域锁定的方向决定。
-BUMP_ZONES = [
+DEFAULT_BUMP_ZONES = [
     {
         'name': 'bump_zone_1',
         'vertices': [
@@ -34,6 +37,18 @@ BUMP_ZONES = [
     # },
 ]
 
+DEFAULT_ENERGY_ZONES = [
+    {
+        'name': 'energy_zone_1',
+        'vertices': [
+            (0.0, 0.0),
+            (0.0, 0.0),
+            (0.0, 0.0),
+            (0.0, 0.0),
+        ],
+    },
+]
+
 # 颠簸区域覆盖发送频率 (Hz)
 BUMP_OVERRIDE_RATE = 50.0
 
@@ -43,8 +58,12 @@ BUMP_REGION_CODE = 5
 BUMP_ALIGN_DELAY_SECONDS = 3.0
 BUMP_ALIGN_TOLERANCE_DEG = 8.0
 BUMP_HOLD_SECONDS = 8.0
+BUMP_EXIT_DEBOUNCE_SECONDS = 0.5
 BUMP_FORWARD_SPEED = -3.8
 BUMP_BACKWARD_SPEED = -3.8
+ENERGY_OVERRIDE_RATE = 20.0
+ENERGY_REGION_CODE = 10
+ENERGY_HOLD_SECONDS = 26.0
 # ================================================
 
 
@@ -98,7 +117,20 @@ class RegionMonitorNode(Node):
                 ],
                 'direction_code': 2,
             },
+            {
+                'name': 'direction_zone_backward_2',
+                'vertices': [
+                    (-5.55, 1.55),
+                    (-7.10, 1.35),
+                    (-6.95, 0.35),
+                    (-5.20, 0.45),
+                ],
+                'direction_code': 2,
+            },
         ]
+        self.regions = deepcopy(self.regions)
+        self.bump_zones = deepcopy(DEFAULT_BUMP_ZONES)
+        self.energy_zones = deepcopy(DEFAULT_ENERGY_ZONES)
         # ===================================================================
 
         # 发布可视化 Marker 的话题
@@ -108,11 +140,19 @@ class RegionMonitorNode(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.yaw_angle_pub = self.create_publisher(Float32, '/cmd_yaw_angle', 10)
         self.region_pub = self.create_publisher(UInt8, '/region', 10)
+        self.active_region_pub = self.create_publisher(UInt8, '/active_region', 10)
         self.big_yaw_aligned_pub = self.create_publisher(UInt8, '/big_yaw_aligned', 10)
         self.enemy_targets_sub = self.create_subscription(
             Target, '/tracker/target', self.enemy_targets_callback, 10)
         self.goal_pose_sub = self.create_subscription(
             PoseStamped, '/goal_pose', self.goal_pose_callback, 10)
+        config_qos = QoSProfile(
+            depth=1,
+            history=HistoryPolicy.KEEP_LAST,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.region_config_sub = self.create_subscription(
+            String, '/region_editor/config', self.region_config_callback, config_qos)
 
         # TF 监听器
         self.tf_buffer = Buffer()
@@ -122,6 +162,9 @@ class RegionMonitorNode(Node):
         self.in_region_prev = False        # 普通区域
         self.in_bump_zone = False          # 颠簸区域
         self.active_bump_zone = None       # 当前激活的颠簸区域配置
+        self.energy_zone_inside = False    # 当前是否处于打符区域几何范围内
+        self.in_energy_zone = False        # 打符区域任务是否激活
+        self.active_energy_zone = None
         self.start_yaw = None              # 节点启动后首次有效 TF 的起始角度(连续角)
         self.current_yaw = 0.0
         self.current_yaw_unwrapped = None
@@ -132,8 +175,12 @@ class RegionMonitorNode(Node):
         self.bump_phase = 'idle'
         self.bump_align_delay_start_time = None
         self.bump_hold_start_time = None
+        self.bump_exit_candidate_start_time = None
         self.big_yaw_aligned = False
         self.travel_direction = 1
+        self.locked_travel_direction = None
+        self.energy_hold_start_time = None
+        self.energy_override_timer = None
 
         # 定时器: 10Hz 检查区域 + 发布可视化
         self.timer = self.create_timer(0.1, self.timer_callback)
@@ -143,7 +190,8 @@ class RegionMonitorNode(Node):
 
         self.get_logger().info(
             f'区域监控节点已启动: {len(self.regions)} 个普通区域, '
-            f'{len(BUMP_ZONES)} 个颠簸区域')
+            f'{len(self.bump_zones)} 个颠簸区域, '
+            f'{len(self.energy_zones)} 个打符区域')
 
     @staticmethod
     def point_in_polygon(px, py, vertices):
@@ -208,15 +256,15 @@ class RegionMonitorNode(Node):
 
             # 3. 检查颠簸区域 + 发布可视化
             prev_in_bump = self.in_bump_zone
-            self.in_bump_zone = False
-            self.active_bump_zone = None
+            raw_in_bump_zone = False
+            raw_active_bump_zone = None
 
-            for i, zone in enumerate(BUMP_ZONES):
+            for i, zone in enumerate(self.bump_zones):
                 verts = zone['vertices']
                 is_inside_this = self.point_in_polygon(current_x, current_y, verts)
                 if is_inside_this:
-                    self.in_bump_zone = True
-                    self.active_bump_zone = zone
+                    raw_in_bump_zone = True
+                    raw_active_bump_zone = zone
 
                 # 颠簸区域可视化 (蓝/橙)
                 marker = self._make_polygon_marker(
@@ -224,6 +272,23 @@ class RegionMonitorNode(Node):
                     inside=is_inside_this,
                     color_in=(1.0, 0.5, 0.0),    # 橙 (激活)
                     color_out=(0.0, 0.5, 1.0),    # 蓝 (未激活)
+                    line_width=0.08)
+                marker_array.markers.append(marker)
+
+            raw_in_energy_zone = False
+            raw_active_energy_zone = None
+            for i, zone in enumerate(self.energy_zones):
+                verts = zone['vertices']
+                is_inside_this = self.point_in_polygon(current_x, current_y, verts)
+                if is_inside_this:
+                    raw_in_energy_zone = True
+                    raw_active_energy_zone = zone
+
+                marker = self._make_polygon_marker(
+                    200 + i, "energy_zones", verts, timestamp,
+                    inside=is_inside_this,
+                    color_in=(1.0, 1.0, 1.0),
+                    color_out=(1.0, 0.8, 0.0),
                     line_width=0.08)
                 marker_array.markers.append(marker)
 
@@ -236,14 +301,43 @@ class RegionMonitorNode(Node):
             elif not in_any_region and self.in_region_prev:
                 self.get_logger().info('<<< 离开监控区域')
             self.in_region_prev = in_any_region
-            if matched_direction_code in (1, 2):
+            if (not self.in_bump_zone) and matched_direction_code in (1, 2):
                 self.travel_direction = matched_direction_code
 
             # 5. 颠簸区域进入/离开处理
+            if raw_in_bump_zone:
+                self.bump_exit_candidate_start_time = None
+                self.in_bump_zone = True
+                self.active_bump_zone = raw_active_bump_zone
+            elif self.in_bump_zone:
+                if self.bump_exit_candidate_start_time is None:
+                    self.bump_exit_candidate_start_time = time.time()
+                elif time.time() - self.bump_exit_candidate_start_time >= BUMP_EXIT_DEBOUNCE_SECONDS:
+                    self.in_bump_zone = False
+                    self.active_bump_zone = None
+                    self.bump_exit_candidate_start_time = None
+            else:
+                self.active_bump_zone = None
+                self.bump_exit_candidate_start_time = None
+
             if self.in_bump_zone and not prev_in_bump:
                 self._on_enter_bump_zone()
             elif not self.in_bump_zone and prev_in_bump:
                 self._on_leave_bump_zone()
+
+            prev_energy_inside = self.energy_zone_inside
+            self.energy_zone_inside = raw_in_energy_zone
+            if raw_in_energy_zone:
+                self.active_energy_zone = raw_active_energy_zone
+            elif not self.in_energy_zone:
+                self.active_energy_zone = None
+
+            if self.energy_zone_inside and not prev_energy_inside and not self.in_energy_zone:
+                self._on_enter_energy_zone()
+            elif (not self.energy_zone_inside) and prev_energy_inside and (not self.in_energy_zone):
+                self.active_energy_zone = None
+
+            self._publish_active_region()
 
         except TransformException:
             pass
@@ -253,10 +347,11 @@ class RegionMonitorNode(Node):
     def _on_enter_bump_zone(self):
         """进入颠簸区域: 启动高频覆盖定时器"""
         zone = self.active_bump_zone
+        self.locked_travel_direction = self.travel_direction
 
         self.get_logger().warn(
             f'>>> 进入颠簸区域 [{zone["name"]}]! '
-            f'当前方向={self._describe_direction_code(self.travel_direction)}, '
+            f'锁定方向={self._describe_direction_code(self.locked_travel_direction)}, '
             f'下发 region={BUMP_REGION_CODE}, '
             f'先等待 {BUMP_ALIGN_DELAY_SECONDS:.1f}s, '
             f'yaw 对齐到 {math.degrees(self._get_bump_target_yaw()):.1f}° 持续 {BUMP_HOLD_SECONDS:.1f}s 后, '
@@ -264,6 +359,7 @@ class RegionMonitorNode(Node):
         self.bump_phase = 'delay_before_align'
         self.bump_align_delay_start_time = time.time()
         self.bump_hold_start_time = None
+        self.bump_exit_candidate_start_time = None
         self.big_yaw_aligned = False
         self._publish_big_yaw_aligned()
 
@@ -282,7 +378,9 @@ class RegionMonitorNode(Node):
         self.bump_phase = 'idle'
         self.bump_align_delay_start_time = None
         self.bump_hold_start_time = None
+        self.bump_exit_candidate_start_time = None
         self.big_yaw_aligned = False
+        self.locked_travel_direction = None
         self._publish_big_yaw_aligned()
 
         # 停止覆盖定时器
@@ -298,6 +396,89 @@ class RegionMonitorNode(Node):
         # 发送一次零速度, 防止惯性
         stop_msg = Twist()
         self.cmd_vel_pub.publish(stop_msg)
+
+    def _on_enter_energy_zone(self):
+        zone = self.active_energy_zone
+        self.in_energy_zone = True
+        self.energy_hold_start_time = time.time()
+        self.get_logger().warn(
+            f'>>> 进入打符区域 [{zone["name"]}], 下发 region={ENERGY_REGION_CODE}, '
+            f'持续 {ENERGY_HOLD_SECONDS:.1f}s')
+
+        region_msg = UInt8()
+        region_msg.data = ENERGY_REGION_CODE
+        self.region_pub.publish(region_msg)
+        self._publish_active_region()
+
+        if self.energy_override_timer is None:
+            self.energy_override_timer = self.create_timer(
+                1.0 / ENERGY_OVERRIDE_RATE, self._energy_override_callback)
+
+    def region_config_callback(self, msg):
+        try:
+            payload = json.loads(msg.data)
+        except json.JSONDecodeError as exc:
+            self.get_logger().warn(f'区域配置解析失败: {exc}')
+            return
+
+        monitor_regions = payload.get('monitor_regions')
+        bump_zones = payload.get('bump_zones')
+        energy_zones = payload.get('energy_zones')
+        if not isinstance(monitor_regions, list) or not isinstance(bump_zones, list) or not isinstance(energy_zones, list):
+            self.get_logger().warn('区域配置格式无效: 缺少 monitor_regions / bump_zones / energy_zones 列表')
+            return
+
+        new_regions = []
+        for index, region in enumerate(monitor_regions):
+            if not isinstance(region, dict):
+                self.get_logger().warn(f'第 {index + 1} 个监控区域格式无效')
+                return
+            vertices = region.get('vertices')
+            direction_code = int(region.get('direction_code', 0))
+            if not self._is_valid_vertices(vertices) or direction_code not in (1, 2):
+                self.get_logger().warn(f'第 {index + 1} 个监控区域数据无效')
+                return
+            new_regions.append({
+                'name': str(region.get('name', f'monitor_region_{index + 1}')),
+                'vertices': self._normalize_vertices(vertices),
+                'direction_code': direction_code,
+            })
+
+        new_bump_zones = []
+        for index, zone in enumerate(bump_zones):
+            if not isinstance(zone, dict):
+                self.get_logger().warn(f'第 {index + 1} 个颠簸区域格式无效')
+                return
+            vertices = zone.get('vertices')
+            if not self._is_valid_vertices(vertices):
+                self.get_logger().warn(f'第 {index + 1} 个颠簸区域数据无效')
+                return
+            new_bump_zones.append({
+                'name': str(zone.get('name', f'bump_zone_{index + 1}')),
+                'vertices': self._normalize_vertices(vertices),
+            })
+
+        new_energy_zones = []
+        for index, zone in enumerate(energy_zones):
+            if not isinstance(zone, dict):
+                self.get_logger().warn(f'第 {index + 1} 个打符区域格式无效')
+                return
+            vertices = zone.get('vertices')
+            if not self._is_valid_vertices(vertices):
+                self.get_logger().warn(f'第 {index + 1} 个打符区域数据无效')
+                return
+            new_energy_zones.append({
+                'name': str(zone.get('name', f'energy_zone_{index + 1}')),
+                'vertices': self._normalize_vertices(vertices),
+            })
+
+        self.regions = new_regions
+        self.bump_zones = new_bump_zones
+        self.energy_zones = new_energy_zones
+        self.get_logger().warn(
+            f'已实时加载区域编辑配置: {len(self.regions)} 个监控区域, '
+            f'{len(self.bump_zones)} 个颠簸区域, '
+            f'{len(self.energy_zones)} 个打符区域')
 
     def _bump_override_callback(self):
         """高频定时器: 在颠簸区域内持续发布强制速度指令和目标 yaw 角度。"""
@@ -315,7 +496,7 @@ class RegionMonitorNode(Node):
                 self.bump_hold_start_time = None
                 self.get_logger().info(
                     f'[颠簸区] 延迟 {BUMP_ALIGN_DELAY_SECONDS:.1f}s 结束，'
-                    f'开始按{self._describe_direction_code(self.travel_direction)}对齐到底盘目标角')
+                    f'开始按{self._describe_direction_code(self._get_active_direction_code())}对齐到底盘目标角')
 
         if self.bump_phase == 'aligning':
             if abs(current_yaw_deg) <= BUMP_ALIGN_TOLERANCE_DEG:
@@ -323,14 +504,14 @@ class RegionMonitorNode(Node):
                     self.bump_hold_start_time = time.time()
                     self.get_logger().info(
                         f'[颠簸区] 当前已接近目标角，'
-                        f'方向={self._describe_direction_code(self.travel_direction)}，'
+                        f'方向={self._describe_direction_code(self._get_active_direction_code())}，'
                         f'角度误差={current_yaw_deg:.1f}°，'
                         f'开始连续计时 {BUMP_HOLD_SECONDS:.1f}s')
                 elif time.time() - self.bump_hold_start_time >= BUMP_HOLD_SECONDS:
                     self.bump_phase = 'driving'
                     self.get_logger().info(
                         f'[颠簸区] 目标角连续稳定 {BUMP_HOLD_SECONDS:.1f}s，'
-                        f'开始按{self._describe_direction_code(self.travel_direction)}通过，'
+                        f'开始按{self._describe_direction_code(self._get_active_direction_code())}通过，'
                         f'速度 {self._get_bump_drive_speed():.1f}m/s')
             else:
                 if self.bump_hold_start_time is not None:
@@ -352,6 +533,39 @@ class RegionMonitorNode(Node):
         region_msg.data = BUMP_REGION_CODE
         self.region_pub.publish(region_msg)
 
+    def _energy_override_callback(self):
+        if not self.in_energy_zone:
+            return
+
+        if self.energy_hold_start_time is None:
+            self.energy_hold_start_time = time.time()
+
+        elapsed = time.time() - self.energy_hold_start_time
+        if elapsed >= ENERGY_HOLD_SECONDS:
+            self._finish_energy_zone()
+            return
+
+        region_msg = UInt8()
+        region_msg.data = ENERGY_REGION_CODE
+        self.region_pub.publish(region_msg)
+        self._publish_active_region()
+
+    def _finish_energy_zone(self):
+        self.get_logger().info(
+            f'<<< 打符区域结束, 已持续 {ENERGY_HOLD_SECONDS:.1f}s, 恢复正常区域码')
+        self.in_energy_zone = False
+        self.energy_hold_start_time = None
+
+        if self.energy_override_timer is not None:
+            self.energy_override_timer.cancel()
+            self.destroy_timer(self.energy_override_timer)
+            self.energy_override_timer = None
+
+        region_msg = UInt8()
+        region_msg.data = 0
+        self.region_pub.publish(region_msg)
+        self._publish_active_region()
+
     def _get_current_relative_yaw_rad(self):
         """返回相对启动基准角的归一化 yaw，范围 [-pi, pi]。"""
         if self.start_yaw is None or self.current_yaw_unwrapped is None:
@@ -367,13 +581,19 @@ class RegionMonitorNode(Node):
 
     def _get_bump_target_yaw(self):
         """根据当前锁定方向返回颠簸区目标朝向。"""
-        if self.travel_direction == 2:
-            return math.radians(180.0)
-        return math.radians(0.0)
+        if self.start_yaw is None:
+            return self.current_yaw
+
+        base_yaw = normalize_angle(self.start_yaw)
+        active_direction = self.locked_travel_direction or self.travel_direction
+        if active_direction == 2:
+            return normalize_angle(base_yaw + math.pi)
+        return base_yaw
 
     def _get_bump_drive_speed(self):
         """根据当前锁定方向返回颠簸区直行速度。"""
-        if self.travel_direction == 2:
+        active_direction = self.locked_travel_direction or self.travel_direction
+        if active_direction == 2:
             return BUMP_BACKWARD_SPEED
         return BUMP_FORWARD_SPEED
 
@@ -390,6 +610,24 @@ class RegionMonitorNode(Node):
         if direction_code == 1:
             return '去程'
         return '未锁定'
+
+    def _get_active_direction_code(self):
+        if self.locked_travel_direction is not None:
+            return self.locked_travel_direction
+        return self.travel_direction
+
+    @staticmethod
+    def _is_valid_vertices(vertices):
+        if not isinstance(vertices, list) or len(vertices) < 3:
+            return False
+        for point in vertices:
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                return False
+        return True
+
+    @staticmethod
+    def _normalize_vertices(vertices):
+        return [(float(point[0]), float(point[1])) for point in vertices]
 
     def _update_big_yaw_aligned(self):
         """根据当前大 yaw 相对启动基准角的误差，更新并发布是否已对齐。"""
@@ -422,7 +660,7 @@ class RegionMonitorNode(Node):
             selected_yaw = self.latest_nav_yaw
             if selected_yaw is None:
                 selected_yaw = self._get_bump_target_yaw()
-            yaw_source = f'颠簸区{self._describe_direction_code(self.travel_direction)}目标角'
+            yaw_source = f'颠簸区{self._describe_direction_code(self._get_active_direction_code())}目标角'
         else:
             selected_yaw = self.latest_enemy_yaw
             yaw_source = '自瞄目标角'
@@ -451,7 +689,7 @@ class RegionMonitorNode(Node):
             yaw_delta = float(-current_relative_yaw_rad)
         elif self.start_yaw is not None:
             sent_yaw_deg = float(math.degrees(normalize_angle(selected_yaw - self.start_yaw)))
-        region_code = BUMP_REGION_CODE if self.in_bump_zone else 0
+        region_code = self._get_active_region_code()
         now = time.time()
         if now - self.last_yaw_log_time >= 0.5:
             self.last_yaw_log_time = now
@@ -464,8 +702,8 @@ class RegionMonitorNode(Node):
             sent_yaw_str = 'None' if sent_yaw_deg is None else f'{sent_yaw_deg:.1f}'
             self.get_logger().info(
                 f'[区域控制] 当前区域码={region_code}，'
-                f'当前阶段={self.bump_phase if self.in_bump_zone else "normal"}，'
-                f'当前方向={self._describe_direction_code(self.travel_direction)}，'
+                f'当前阶段={self._describe_control_phase()}，'
+                f'当前方向={self._describe_direction_code(self._get_active_direction_code())}，'
                 f'角度来源={yaw_source}，'
                 f'启动基准角={start_yaw_str}度，'
                 f'当前相对车头角={current_yaw_str}度，'
@@ -475,6 +713,25 @@ class RegionMonitorNode(Node):
         yaw_msg = Float32()
         yaw_msg.data = 0.0 if sent_yaw_deg is None else sent_yaw_deg
         self.yaw_angle_pub.publish(yaw_msg)
+
+    def _get_active_region_code(self):
+        if self.in_energy_zone:
+            return ENERGY_REGION_CODE
+        if self.in_bump_zone:
+            return BUMP_REGION_CODE
+        return 0
+
+    def _publish_active_region(self):
+        msg = UInt8()
+        msg.data = int(self._get_active_region_code())
+        self.active_region_pub.publish(msg)
+
+    def _describe_control_phase(self):
+        if self.in_energy_zone:
+            return "energy_active"
+        if self.in_bump_zone:
+            return self.bump_phase
+        return "normal"
 
     # ================= 可视化辅助 =================
 
